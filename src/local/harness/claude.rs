@@ -1393,19 +1393,24 @@ struct TurnState {
     /// per message id (subagent events namespaced by `parent_tool_use_id`) —
     /// see the `assistant` arm for why this offset exists.
     assistant_blocks_seen: HashMap<String, usize>,
-    /// Background (`local_agent`) tasks spawned this turn that haven't reached
-    /// their terminal `task_notification` yet, task_id → spawning tool_use_id.
+    /// Background sub-agents (and, in a spawned helper, background shell
+    /// commands) started this turn that haven't reached their terminal
+    /// `task_notification` yet, keyed by task_id.
     /// A `result` while entries remain is a segment boundary, not the end of
     /// the turn — the CLI auto-resumes with the task's report once it
     /// finishes, and ending the turn there would silently drop that whole
-    /// continuation. The tool_use_id side keeps the spawn part `running` (the
+    /// continuation. The tool_use_id keeps the spawning part `running` (the
     /// async launch acknowledgement would otherwise complete it at launch and
-    /// kill every running indicator while the agent works).
-    pending_tasks: HashMap<String, Option<String>>,
+    /// kill every running indicator while the task works).
+    pending_tasks: HashMap<String, PendingTask>,
     /// Whether any background task ran this turn (stays true after completion)
     /// — gates the post-result grace wait for the auto-resume segment, which
     /// can trail the result even when every task already finished.
     saw_background_task: bool,
+}
+
+struct PendingTask {
+    tool_use_id: Option<String>,
 }
 
 /// The spawning `Task` tool_use id for a sub-agent event (`parent_tool_use_id`),
@@ -1602,18 +1607,16 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                     state.native_session_id = Some(sid.to_string());
                 }
             }
-            // Track background sub-agents so the `result` arm knows a turn
-            // isn't over while one still runs (see `pending_tasks`).
             Some("task_started") => {
                 if event.get("task_type").and_then(Value::as_str) == Some("local_agent") {
                     if let Some(id) = event.get("task_id").and_then(Value::as_str) {
-                        // No tool_use_id → no spawn-part association; the
-                        // task still gates the turn's end.
-                        let tool_id = event
+                        let tool_use_id = event
                             .get("tool_use_id")
                             .and_then(Value::as_str)
                             .map(str::to_string);
-                        state.pending_tasks.insert(id.to_string(), tool_id);
+                        state
+                            .pending_tasks
+                            .insert(id.to_string(), PendingTask { tool_use_id });
                         state.saw_background_task = true;
                     }
                 }
@@ -1622,15 +1625,15 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
             // — the async-launch tool_result deliberately left it `running`.
             Some("task_notification") => {
                 if let Some(id) = event.get("task_id").and_then(Value::as_str) {
-                    let tool_id = state.pending_tasks.remove(id).flatten();
-                    if let Some(part) = tool_id
-                        .as_deref()
-                        .and_then(|tid| find_part_mut(&mut ctx.assistant.parts, tid))
+                    let task = state.pending_tasks.remove(id);
+                    if let Some(part) = task
+                        .and_then(|task| task.tool_use_id)
+                        .and_then(|tid| find_part_mut(&mut ctx.assistant.parts, &tid))
                     {
                         if let Some(part_state) = part.state.as_mut() {
                             if part_state.status == "running" {
-                                let ok = event.get("status").and_then(Value::as_str)
-                                    == Some("completed");
+                                let status = event.get("status").and_then(Value::as_str);
+                                let ok = status == Some("completed");
                                 part_state.status = if ok { "completed" } else { "error" }.into();
                                 if !ok {
                                     // Give the failure a real message — the
@@ -1860,7 +1863,7 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                     && state
                         .pending_tasks
                         .values()
-                        .any(|tid| tid.as_deref() == Some(part_id.as_str()));
+                        .any(|task| task.tool_use_id.as_deref() == Some(part_id.as_str()));
                 if launch_ack {
                     continue;
                 }
@@ -1920,10 +1923,6 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                 }
             }
             state.had_activity |= report_result_usage(ctx, event).is_some_and(|used| used > 0);
-            // A result while background sub-agents still run is only a segment
-            // boundary: the model ended ITS reply, but the CLI auto-resumes
-            // with the agents' reports when they finish. Keep listening — the
-            // continuation's own result (no tasks pending) ends the turn.
             if !state.pending_tasks.is_empty() {
                 return false;
             }
@@ -2271,8 +2270,8 @@ async fn run_attempt(ctx: &mut TurnCtx, spec: SpawnSpec) -> Result<(TurnState, u
                     // report as a fresh segment: init + messages + another
                     // result). Give that continuation a short window to show up
                     // before ending the turn; a quiet window means the report
-                    // was already delivered in this segment.
-                    if !state.saw_background_task {
+                    // was already delivered in this segment. A failed turn has nothing to resume.
+                    if !state.saw_background_task || state.turn_errored {
                         break;
                     }
                     match tokio::time::timeout(BACKGROUND_RESUME_GRACE, rx.recv()).await {
@@ -3481,6 +3480,30 @@ mod tests {
             apply_event(&mut ctx, &mut state, &result),
             "the post-continuation result ends the turn"
         );
+    }
+
+    /// Claude Code 2.1.284's stream for a background Bash: the model replies
+    /// with progress, the CLI emits a result, then resumes once the command ends.
+    const BACKGROUND_BASH_STREAM: &[&str] = &[
+        r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"toolu_b","name":"Bash","input":{"command":"sleep 8; echo FINISHED-42","run_in_background":true}}]}}"#,
+        r#"{"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"toolu_b","task_type":"local_bash","is_backgrounded":true}"#,
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_b","content":"Command running in background with ID: b1."}]}}"#,
+        r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"The command is running in the background."}]}}"#,
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"The command is running in the background."}"#,
+        r#"{"type":"system","subtype":"task_notification","task_id":"b1","tool_use_id":"toolu_b","status":"completed"}"#,
+        r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+        r#"{"type":"assistant","message":{"id":"m3","content":[{"type":"text","text":"FINISHED-42"}]}}"#,
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"FINISHED-42"}"#,
+    ];
+
+    #[test]
+    fn ordinary_chat_ends_at_reply_over_background_shell() {
+        let mut ctx = TurnCtx::test_stub();
+        let mut state = TurnState::default();
+        let end = BACKGROUND_BASH_STREAM.iter().position(|line| {
+            apply_event(&mut ctx, &mut state, &serde_json::from_str(line).unwrap())
+        });
+        assert_eq!(end, Some(4));
     }
 
     #[test]

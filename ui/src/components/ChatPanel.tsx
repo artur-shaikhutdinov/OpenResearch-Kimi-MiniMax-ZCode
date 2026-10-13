@@ -18,10 +18,19 @@ import { useChatState } from "../queries/chatStore";
 
 import {
   getHarnessesQuery,
+  getHarnessSetupCommandsQuery,
   getSkillsQuery,
 } from "../queries/settings";
 import { listChatSessionsQuery, getChatMessagesQuery, listNativeChatsQuery, readSidebarChatPage } from "../queries/chat";
 import { getProjectStarterPromptsQuery, listProjectsQuery, listProjectActivityQuery } from "../queries/projects";
+import { getCodeTreeQuery } from "../queries/files";
+import {
+  fileMentionContext,
+  insertFileMention,
+  matchFileMentions,
+  mentionCandidates,
+  type FileMentionMatch,
+} from "../fileMentions";
 import { m } from "../paraglide/messages.js";
 import { autoDir, ltr } from "../i18n";
 import { useLocale } from "../locale";
@@ -55,7 +64,6 @@ import {
   Search,
   SlidersHorizontal,
   SquareTerminal,
-  Terminal,
   ToggleRight,
   TriangleAlert,
   Users,
@@ -78,6 +86,7 @@ import {
   cancelQueuedMessage,
   chatAttachmentUrl,
   createChatSession,
+  getChatSession,
   deleteChatSession,
   DEMO_FIGURE_SESSION_ID,
   DEMO_LITERATURE_SESSION_ID,
@@ -88,6 +97,7 @@ import {
   DEMO_SEEDED_LEAF_IDS,
   forkChatTurn,
   fmtNumber,
+  harnessModelLabel,
   interruptChat,
   reasoningFor,
   recoverChatTurn,
@@ -168,8 +178,9 @@ import { LitSourceLogo, parseOrxLit, paperUrl } from "./LitSourceLogo";
 import { LitSourcesList } from "./LitSourcesPicker";
 import { ChatImageScope, Md } from "./Md";
 import { PlanStrip } from "./PlanStrip";
-import { SETTINGS_NAV, type SettingsTab } from "./SettingsPage";
+import { SETTINGS_NAV, harnessSetupPath, type SettingsTab } from "./SettingsPage";
 import { SkillMenu } from "./SkillMenu";
+import { FileMentionMenu } from "./FileMentionMenu";
 import { ComposerSkillChips, MessageWithChips, skillMarginSpaces } from "./SkillChips";
 import { WorkspaceConnection } from "./WorkspaceConnection";
 import {
@@ -2676,11 +2687,11 @@ function PromptCard({
     // harness-agnostic permission-mode wire ids).
     const docked = !!onOpenPlan;
     return (
-      <div className={`prompt-card my-2 mx-0 py-3 px-3.5 border border-border border-s-[3px] border-s-border rounded-sm bg-surface flex flex-col gap-[9px] [&.plan]:border-s-accent-blue [&.permission]:border-s-accent-amber [&.question]:border-s-accent-purple [&.readonly]:opacity-60 plan ${done ? "readonly" : ""}`}>
+      <div className={`prompt-card my-2 mx-0 py-3 px-3.5 border border-border border-s-[3px] border-s-border rounded-sm bg-accent-blue-subtle flex flex-col gap-[9px] [&.plan]:border-s-accent-blue [&.permission]:border-s-accent-amber [&.question]:border-s-accent-purple [&.readonly]:opacity-60 plan ${done ? "readonly" : ""}`}>
         <div className="prompt-head text-base font-semibold text-text">
           {p.synthesized ? m.chat_plan_ready() : m.chat_proposed_plan()}
         </div>
-        <div className={`prompt-plan text-base leading-[1.6] text-text max-h-85 overflow-y-auto [&.clamped]:max-h-[9.5em] [&.clamped]:overflow-hidden [&.clamped]:relative [&.clamped::after]:content-[''] [&.clamped::after]:absolute [&.clamped::after]:inset-x-0 [&.clamped::after]:bottom-0 [&.clamped::after]:top-auto [&.clamped::after]:h-8.5 [&.clamped::after]:bg-[linear-gradient(to_bottom,_transparent,_var(--surface))] [&.clamped::after]:pointer-events-none ${docked ? "clamped" : ""}`}>
+        <div className={`prompt-plan text-base leading-[1.6] text-text max-h-85 overflow-y-auto [&.clamped]:max-h-[9.5em] [&.clamped]:overflow-hidden [&.clamped]:relative [&.clamped::after]:content-[''] [&.clamped::after]:absolute [&.clamped::after]:inset-x-0 [&.clamped::after]:bottom-0 [&.clamped::after]:top-auto [&.clamped::after]:h-8.5 [&.clamped::after]:bg-[linear-gradient(to_bottom,_transparent,_var(--accent-blue-subtle))] [&.clamped::after]:pointer-events-none ${docked ? "clamped" : ""}`}>
           <Md text={p.plan ?? ""} onOpenFile={onOpenFile} />
         </div>
         {docked && (
@@ -2780,7 +2791,7 @@ function PromptCard({
         : [label],
     );
   return (
-    <div className={`prompt-card my-2 mx-0 py-3 px-3.5 border border-border border-s-[3px] border-s-border rounded-sm bg-surface flex flex-col gap-[9px] [&.plan]:border-s-accent-blue [&.permission]:border-s-accent-amber [&.question]:border-s-accent-purple [&.readonly]:opacity-60 question ${done ? "readonly" : ""}`}>
+    <div className={`prompt-card my-2 mx-0 py-3 px-3.5 border border-border border-s-[3px] border-s-border rounded-sm bg-accent-purple-subtle flex flex-col gap-[9px] [&.plan]:border-s-accent-blue [&.permission]:border-s-accent-amber [&.question]:border-s-accent-purple [&.readonly]:opacity-60 question ${done ? "readonly" : ""}`}>
       {p.header && <div className={PROMPT_HEAD_CLASS_NAME}>{p.header}</div>}
       {p.question && <div className="prompt-q text-base font-semibold leading-normal text-text">{p.question}</div>}
       <div className="prompt-options flex flex-col gap-1.5">
@@ -3044,7 +3055,7 @@ const Message = memo(function Message({
       };
       return (
         <div className="msg-user-group ms-auto self-end flex w-full max-w-[88%] flex-col items-end gap-1.5">
-          <div className="msg-user-edit w-full bg-surface rounded-[16px] py-2.5 px-[15px] flex flex-col gap-2">
+          <div className="msg-user-edit w-full bg-panel rounded-[16px] py-2.5 px-[15px] flex flex-col gap-2">
             <textarea
               dir="auto"
               className="w-full bg-transparent text-base text-text resize-none outline-none field-sizing-content min-h-16"
@@ -3084,7 +3095,7 @@ const Message = memo(function Message({
         {annotations.length > 0 && (
           <AnnotationsPopover annotations={annotations} variant="sent" />
         )}
-        <div dir="auto" className="msg-user max-w-full bg-surface rounded-[16px] py-2.5 px-[15px] text-base whitespace-pre-wrap wrap-anywhere [&_.skill-chip]:align-baseline">
+        <div dir="auto" className="msg-user max-w-full bg-panel rounded-[16px] py-2.5 px-[15px] text-base whitespace-pre-wrap wrap-anywhere [&_.skill-chip]:align-baseline">
           <MessageWithChips text={text} isCommand={isCommand} />
           {images.length > 0 && (
             <div className="msg-images flex flex-wrap gap-1.5 mt-2 [&_img]:max-w-55 [&_img]:max-h-40 [&_img]:border [&_img]:border-border-variant [&_img]:rounded-xs [&_img]:block">
@@ -3236,7 +3247,7 @@ function ShellExchangeCard({ part }: { part: ChatPart }) {
       : null;
   return (
     <div className="msg-shell ms-auto self-end flex w-full max-w-[88%] flex-col items-stretch gap-1.5">
-      <div dir="ltr" className="max-w-full bg-surface rounded-[16px] py-2.5 px-[15px] text-base">
+      <div dir="ltr" className="max-w-full bg-panel rounded-[16px] py-2.5 px-[15px] text-base">
         <div className="flex items-start gap-2 font-mono text-sm text-text whitespace-pre-wrap wrap-anywhere">
           <span className="sr-only">{m.chat_panel_bash()} </span>
           <SquareTerminal
@@ -3378,7 +3389,7 @@ function renderParts(
           dir="auto"
           role="note"
           aria-label={m.chat_panel_you_mid_task()}
-          className="msg-steer my-2 ms-auto w-fit max-w-[88%] bg-surface rounded-[16px] py-2.5 px-[15px] text-base whitespace-pre-wrap wrap-anywhere"
+          className="msg-steer my-2 ms-auto w-fit max-w-[88%] bg-panel rounded-[16px] py-2.5 px-[15px] text-base whitespace-pre-wrap wrap-anywhere"
         >
           {part.text}
         </div>,
@@ -4059,9 +4070,7 @@ function SessionRow({
       className={`session-row relative flex items-center gap-2 w-full text-start py-[7px] ps-2.5 pe-1.5 rounded-md text-sm text-text cursor-pointer select-none [&:hover:not(.active)]:bg-surface [&.active]:bg-panel [&.active]:font-medium [&_.session-dot:empty]:hidden [&_.session-dot]:w-4 [&_.session-dot]:inline-flex [&_.session-dot]:items-center [&_.session-dot]:justify-center [&_.session-dot]:shrink-0 [&_.session-title]:flex-1 [&_.session-title]:min-w-0 [&_.session-title]:overflow-hidden [&_.session-title]:[mask-image:linear-gradient(to_right,black_calc(100%_-_16px),transparent)] [&_.session-title]:whitespace-nowrap [&_.session-menu-btn]:hidden [&_.session-menu-btn]:items-center [&_.session-menu-btn]:justify-center [&_.session-menu-btn]:w-4 [&_.session-menu-btn]:h-4 [&_.session-menu-btn]:-my-0.5 [&_.session-menu-btn]:mx-0 [&_.session-menu-btn]:rounded-sm [&_.session-menu-btn]:text-muted [&_.session-menu-btn]:shrink-0 [&_.session-menu-btn:hover]:text-text [&_.session-menu-btn:hover]:bg-panel [&:hover_.session-menu-btn]:inline-flex [&:focus-visible_.session-menu-btn]:inline-flex [&_.session-menu-btn:focus-visible]:inline-flex [&.menu-open_.session-menu-btn]:inline-flex [&:hover_.session-dot]:hidden [&:focus-visible_.session-dot]:hidden [&:has(.session-menu-btn:focus-visible)_.session-dot]:hidden [&.menu-open_.session-dot]:hidden [&_.busy-dot]:w-[7px] [&_.busy-dot]:h-[7px] [&_.busy-dot]:rounded-full [&_.busy-dot]:bg-primary [&_.busy-dot]:animate-[or-pulse_1.2s_infinite] [&_.busy-dot]:shrink-0 [&_.unread-dot]:w-[7px] [&_.unread-dot]:h-[7px] [&_.unread-dot]:rounded-full [&_.unread-dot]:bg-primary [&_.unread-dot]:shrink-0 [&_.busy-dot.waiting]:animate-none [&_.session-title-input]:flex-1 [&_.session-title-input]:min-w-0 [&_.session-title-input]:py-px [&_.session-title-input]:px-[5px] [&_.session-title-input]:-my-0.5 [&_.session-title-input]:mx-0 [&_.session-title-input]:[font:inherit] [&_.session-title-input]:text-text [&_.session-title-input]:bg-background [&_.session-title-input]:border [&_.session-title-input]:border-primary [&_.session-title-input]:rounded-sm [&_.session-title-input]:outline-none [&.editing]:bg-surface [&.editing]:cursor-default [&.editing_.session-menu-btn]:hidden [&.editing_.session-dot]:hidden ${active ? "active" : ""}  ${unread ? "unread" : ""}  ${open ? "menu-open" : ""}  ${
         editing ? "editing" : ""
         }`}
-      title={`${HARNESS_LABELS[session.harness]}${session.model ? ` · ${session.model}` : ""}${
-        session.parentSessionId ? m.chat_spawned_by_agent() : ""
-        }`}
+      title={`${HARNESS_LABELS[session.harness]}${session.model ? ` · ${session.model}` : ""}`}
       onClick={() => {
         // While editing, a body click is a no-op; blur/Enter/Esc drive it.
         if (editing) return;
@@ -4084,9 +4093,6 @@ function SessionRow({
         }
       }}
     >
-      {session.parentSessionId && !editing && (
-        <Users className="text-muted shrink-0" size={12} aria-hidden />
-      )}
       {editing ? (
         <input
           ref={inputRef}
@@ -4173,7 +4179,7 @@ function SessionRow({
 
 // The four starter prompts progress starting point → gap → baseline → experiment.
 const STARTER_ICONS = [BookOpen, Search, SquareTerminal, FlaskConical];
-// A blank project has nothing for a model to read, so its prompts are pre-written.
+// Shown for a blank project when prompts tailored to its researcher aren't available.
 const blankStarterPrompts = (): StarterPrompt[] => [
   { title: m.chat_panel_starter_blank_1_title(), prompt: m.chat_panel_starter_blank_1_prompt() },
   { title: m.chat_panel_starter_blank_2_title(), prompt: m.chat_panel_starter_blank_2_prompt() },
@@ -4231,7 +4237,6 @@ export function ChatPanel({
   runtime,
   onOpenDemoWelcome,
   composerFocusNonce = 0,
-  demoRunningRunId = null,
   activeSessionId,
   onActiveSessionChange,
   preferredAgent,
@@ -4240,6 +4245,7 @@ export function ChatPanel({
   onPreferredAutonomyChange,
   embedded = false,
   onOpenSideChat,
+  onRunSetup,
   children,
 }: {
   projectId: string;
@@ -4254,6 +4260,8 @@ export function ChatPanel({
   /** Reopen the rail (from the chat header's sidebar icon). */
   onShowRail: () => void;
   onNewProject?: () => void;
+  /** Run a harness setup command (`path` is its setup route) in the right panel's terminal tab. */
+  onRunSetup?: (command: string, path: string) => void;
   /** Settings sections replace chat; Artifacts remains a right-panel tool. */
   mainView: "chat" | "skills" | SettingsTab;
   onSelectMainView: (view: "chat" | "skills" | SettingsTab) => void;
@@ -4298,7 +4306,6 @@ export function ChatPanel({
   /** Increments when the demo welcome hands focus to the composer. */
   composerFocusNonce?: number;
   /** Demo run currently executing, for the monitor-it hint above the composer. */
-  demoRunningRunId?: string | null;
   activeSessionId: string | null;
   onActiveSessionChange: (sessionId: string | null, options?: { replace?: boolean; projectId?: string }) => void;
   /** Database-backed selection used to seed new chat sessions. */
@@ -4402,7 +4409,6 @@ export function ChatPanel({
   const [unreadSessionIds, setUnreadSessionIds] = useState<ReadonlySet<string>>(new Set());
   const [draft, setDraft] = useState("");
   const [demoHintDismissed, setDemoHintDismissed] = useState(false);
-  const [demoRunHintDismissed, setDemoRunHintDismissed] = useState(false);
   const [annotations, setAnnotations] = useState<ComposerAnnotation[]>([]);
   const annotationId = useRef(0);
   const composerScopeRef = useRef({ projectId, activeId, mainView });
@@ -4414,6 +4420,7 @@ export function ChatPanel({
   // Pasted/dropped/uploaded attachments waiting in the composer, as data URLs.
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
   const [attachError, setAttachError] = useState<string | null>(null);
+  const [imageRefusedFor, setImageRefusedFor] = useState<string | null>(null);
   // Unsent composer content belongs to the scope it was typed in — stash on
   // the way out, restore on return, so a draft can't bleed into another chat.
   const stashKey = activeId ?? `${projectId}:new`;
@@ -4445,6 +4452,7 @@ export function ChatPanel({
     setDraft(restored.draft);
     setAttachments(restored.attachments);
     setAnnotations(restored.annotations);
+    setImageRefusedFor(null);
     return () => {
       const stashed = composerStashContent(composerLiveRef.current, composerPrefill);
       if (stashed) composerStashRef.current.set(stashKey, stashed);
@@ -4520,6 +4528,7 @@ export function ChatPanel({
   // matches, wherever in the message it was typed.
 
   const [skillIdx, setSkillIdx] = useState(0);
+  const [mentionIdx, setMentionIdx] = useState(0);
   const [skillMenuDismissed, setSkillMenuDismissed] = useState(false);
   const [modelPickerRequest, setModelPickerRequest] = useState(0);
   const [composerCursor, setComposerCursor] = useState(0);
@@ -4544,6 +4553,17 @@ export function ChatPanel({
     const tokenName = skill.name.replace(/@u$/, "^").replace(/@p$/, "~");
     const marginSpaces = skill.source === "command" ? 1 : skillMarginSpaces(tokenName, composerRef.current);
     const next = insertSlashCommand(draft, slashContext, tokenName, marginSpaces);
+    setDraft(next.text);
+    window.requestAnimationFrame(() => {
+      composerRef.current?.focus();
+      composerRef.current?.setSelectionRange(next.cursor, next.cursor);
+      setComposerCursor(next.cursor);
+    });
+  }
+
+  function pickFileMention(match: FileMentionMatch) {
+    if (!mentionContext) return;
+    const next = insertFileMention(draft, mentionContext, match);
     setDraft(next.text);
     window.requestAnimationFrame(() => {
       composerRef.current?.focus();
@@ -4581,9 +4601,14 @@ export function ChatPanel({
     const MAX_BYTES = 30 * 1024 * 1024;
     const TOTAL_BYTES = 40 * 1024 * 1024;
     setAttachError(null);
+    setImageRefusedFor(null);
     let total = attachments.reduce((n, a) => n + a.size, 0);
     for (const file of files) {
       if (!/^(image\/(png|jpeg|gif|webp)|application\/pdf)$/.test(file.type)) continue;
+      if (noImageInputError && file.type.startsWith("image/")) {
+        setImageRefusedFor(selectedModel?.id ?? null);
+        continue;
+      }
       if (file.size > MAX_BYTES) {
         setAttachError(m.chat_attachment_too_large({ name: ltr(file.name) }));
         continue;
@@ -4662,6 +4687,14 @@ export function ChatPanel({
     ? harnesses.find((h) => h.id === rawSelection.harness)
     : undefined;
   const opts = activeHarness?.options;
+  const { data: setupCommands } = useQuery({ ...getHarnessSetupCommandsQuery(), enabled: !!onRunSetup });
+  const setupPath = (command: string) => {
+    if (!activeHarness) return undefined;
+    const setup = setupCommands?.[activeHarness.id];
+    // The setup route refuses a Claude login its auth state rules out.
+    if (activeHarness.id === "claude-code" && command === setup?.login && !activeHarness.loginEligible) return undefined;
+    return harnessSetupPath(activeHarness, setup, command);
+  };
   const commands = useMemo(
     () => commandsForHarness(skills, opts?.planActivation),
     [skills, opts?.planActivation],
@@ -4686,6 +4719,22 @@ export function ChatPanel({
   const skillMenuOpen = skillMatches.length > 0;
   const activeSkillIdx = Math.min(skillIdx, Math.max(0, skillMatches.length - 1));
   useEffect(() => setSkillIdx(0), [slashToken]);
+  // `@path` mentions list the checkout the agent works in; the text is sent as typed.
+  const mentionContext = bashMode ? null : fileMentionContext(draft, composerCursor);
+  const mentionQuery = mentionContext?.end === composerCursor ? mentionContext.query : null;
+  const mentionTree = useQuery({
+    ...getCodeTreeQuery(projectId, activeId ? { sessionId: activeId } : {}),
+    enabled: mentionQuery !== null,
+  });
+  const mentionEntries = mentionTree.data?.entries;
+  const mentionPool = useMemo(() => mentionCandidates(mentionEntries ?? []), [mentionEntries]);
+  const mentionMatches = useMemo(
+    () => (mentionQuery !== null && !skillMenuDismissed ? matchFileMentions(mentionPool, mentionQuery) : []),
+    [mentionPool, mentionQuery, skillMenuDismissed],
+  );
+  const mentionMenuOpen = mentionMatches.length > 0;
+  const activeMentionIdx = Math.min(mentionIdx, Math.max(0, mentionMatches.length - 1));
+  useEffect(() => setMentionIdx(0), [mentionQuery]);
   // Reconcile the selected model's settings, including stale saved preferences,
   // without replacing custom model IDs that are absent from the catalog.
   const composerSelection = deriveComposerSelection(rawSelection, activeHarness);
@@ -4693,6 +4742,16 @@ export function ChatPanel({
   // OpenCode model with no `variants` hides the picker entirely, and Codex's
   // top tiers appear only on the models that accept them.
   const reasoning = reasoningFor(activeHarness, composerSelection?.model);
+  const selectedModel = activeHarness?.models.find((model) => model.id === composerSelection?.model);
+  // OpenCode reports a text-only model's image Read as both success and error, so refuse up front.
+  const noImageInputError = selectedModel?.imageInput === false
+    ? m.chat_model_no_image_input({ model: ltr(harnessModelLabel(selectedModel)) })
+    : null;
+  const imageInputBlocked =
+    !!noImageInputError && attachments.some((a) => a.mediaType.startsWith("image/"));
+  const imageRefused = !!selectedModel && imageRefusedFor === selectedModel.id;
+  const imageInputError = imageInputBlocked || imageRefused ? noImageInputError : null;
+  useEffect(() => setImageRefusedFor(null), [selectedModel?.id]);
 
   // Editing the pickers: every change updates the sticky global preference —
   // the config a "New session" composer opens with is whatever the user chose
@@ -5083,7 +5142,6 @@ export function ChatPanel({
         : new Set(),
     );
     setDemoHintDismissed(false);
-    setDemoRunHintDismissed(false);
     setTitleReveals(new Map());
     seenTitles.current = new Map();
     void syncSessionList();
@@ -5439,11 +5497,11 @@ export function ChatPanel({
   }, [pinTranscriptToBottom]);
 
   /** `queue` (the ⌘/Ctrl+Enter chord) parks the message even on a harness that steers. */
-  async function send({ queue = false }: { queue?: boolean } = {}) {
+  async function send({ queue = false, starter }: { queue?: boolean; starter?: string } = {}) {
     // Slash tokens stay in the wire form: the server resolves every selected
     // skill and supplies this exact message as their shared request context.
-    const originalText = draft.trim();
-    const composerCommand = !pendingQuestion
+    const originalText = (starter ?? draft).trim();
+    const composerCommand = !pendingQuestion && starter === undefined
       ? parseComposerCommand(originalText, opts?.planActivation)
       : null;
     if (composerCommand && composerCommand.name !== "plan") {
@@ -5452,11 +5510,14 @@ export function ChatPanel({
       runComposerCommand(composerCommand.name, composerCommand.prompt);
       return;
     }
-    captureUiEvent({
-      name: "first_action",
-      surface: telemetrySurface,
-      action: "typed_prompt",
-    });
+    if (imageInputBlocked) return;
+    if (starter === undefined) {
+      captureUiEvent({
+        name: "first_action",
+        surface: telemetrySurface,
+        action: "typed_prompt",
+      });
+    }
     if (preparingSend.current) return;
     const planRequested = !!composerCommand;
     const toggledPlanMode = !planActive;
@@ -5583,6 +5644,7 @@ export function ChatPanel({
       setAttachments([]);
       setAnnotations([]);
       setAttachError(null);
+      setImageRefusedFor(null);
       // Always send the composer's settings, steer or not: a permission or
       // plan change persists itself before this message, so the server's
       // comparison against the *running* turn is the only thing that catches
@@ -5649,6 +5711,7 @@ export function ChatPanel({
       setAttachments((current) => current === pending ? [] : current);
       setAnnotations((current) => (current === pendingAnnotations ? [] : current));
       setAttachError(null);
+      setImageRefusedFor(null);
       preparingSend.current = true;
       try {
         if (!sid) {
@@ -5963,7 +6026,7 @@ export function ChatPanel({
   // must own the key ahead of this document-level bubble listener, by one of
   // two means already in use — a new overlay has to pick one or it will
   // interrupt the turn on Escape:
-  //   - the slash menu preventDefaults in the composer's onKeyDown (bubble),
+  //   - the slash and @file menus preventDefault in the composer's onKeyDown (bubble),
   //     so the `defaultPrevented` guard below defers to it;
   //   - the composer pickers (usePopover) stopPropagation in the capture phase,
   //     so their Escape never reaches this listener at all.
@@ -6097,11 +6160,19 @@ export function ChatPanel({
     }
   }, [projectId, onActiveSessionChange]);
 
-  /** Follow a spawn card and reveal its session in the rail. */
   const openSpawnedSession = useCallback(
-    (sessionId: string) => {
-      setSessionFilter("all");
-      onActiveSessionChange(sessionId);
+    async (sessionId: string) => {
+      const visit = projectVisitRef.current;
+      const scope = composerScopeRef.current;
+      try {
+        const session = await getChatSession(sessionId);
+        if (projectVisitRef.current !== visit || composerScopeRef.current !== scope) return;
+        setSessionFilter("all");
+        onActiveSessionChange(sessionId, { projectId: session.projectId });
+      } catch (error) {
+        if (projectVisitRef.current !== visit || composerScopeRef.current !== scope) return;
+        showAlert(error instanceof Error ? error.message : String(error), "error");
+      }
     },
     [onActiveSessionChange],
   );
@@ -6447,19 +6518,19 @@ export function ChatPanel({
         ) : contentLoading || historyLoading ? (
           <div className="chat-loading flex-1 min-h-0 overflow-hidden [scrollbar-gutter:stable_both-edges]" role="status" aria-label={m.chat_panel_loading_conversation()} aria-busy="true">
             <div aria-hidden="true" className="mx-auto flex h-full w-full max-w-readable flex-col gap-6 px-4 pb-8 pt-4 motion-safe:animate-pulse">
-              <div className="ms-auto h-14 w-3/5 shrink-0 rounded-lg bg-surface" />
+              <div className="ms-auto h-14 w-3/5 shrink-0 rounded-lg bg-panel" />
               <div className="flex shrink-0 flex-col gap-3">
                 {["w-5/6", "w-full", "w-11/12", "w-2/3", "w-full", "w-3/4", "w-1/2"].map((width, index) => (
-                  <div key={index} className={`h-3 rounded bg-surface ${width}`} />
+                  <div key={index} className={`h-3 rounded bg-panel ${width}`} />
                 ))}
               </div>
-              <div className="ms-auto h-10 w-2/5 shrink-0 rounded-lg bg-surface" />
+              <div className="ms-auto h-10 w-2/5 shrink-0 rounded-lg bg-panel" />
               <div className="flex shrink-0 flex-col gap-3">
                 {["w-full", "w-11/12", "w-3/4", "w-5/6", "w-1/2", "w-full", "w-5/6", "w-11/12", "w-2/3", "w-3/4", "w-1/3"].map((width, index) => (
-                  <div key={index} className={`h-3 rounded bg-surface ${width}`} />
+                  <div key={index} className={`h-3 rounded bg-panel ${width}`} />
                 ))}
               </div>
-              <div className="ms-auto h-16 w-1/2 shrink-0 rounded-lg bg-surface" />
+              <div className="ms-auto h-16 w-1/2 shrink-0 rounded-lg bg-panel" />
             </div>
           </div>
         ) : !threadMounted && activeSession?.sideParentSessionId ? (
@@ -6483,9 +6554,9 @@ export function ChatPanel({
                     >
                       <span className={`flex w-full items-center gap-2.5 ${STARTER_TONES[index].icon}`}>
                         <Icon size={17} />
-                        <span className="h-3.5 w-2/5 rounded bg-surface-bright" />
+                        <span className="h-3.5 w-2/5 rounded bg-panel" />
                       </span>
-                      <span className="h-3 w-4/5 rounded bg-surface" />
+                      <span className="h-3 w-4/5 rounded bg-panel" />
                     </div>
                   ))}
                 </div>
@@ -6500,27 +6571,41 @@ export function ChatPanel({
                 {starterPrompts.map((item, index) => {
                   const Icon = STARTER_ICONS[index];
                   const tone = STARTER_TONES[index];
+                  const pickStarter = (edit: boolean) => {
+                    captureUiEvent({ name: "project_starter_clicked", slot: index + 1 });
+                    captureUiEvent({
+                      name: "first_action",
+                      surface: telemetrySurface,
+                      action: "starter_click",
+                    });
+                    // Don't auto-send past an unavailable agent or a non-empty composer.
+                    const composerEmpty = !draft.trim() && attachments.length === 0 && annotations.length === 0;
+                    if (edit || !activeHarness?.agentReady || !composerEmpty) applyStarterPrompt(item.prompt);
+                    else void send({ starter: item.prompt });
+                  };
                   return (
-                    <button
-                      key={index}
-                      type="button"
-                      className={`flex min-h-22 w-full min-w-0 cursor-pointer flex-col items-start justify-center gap-1.5 rounded-xl border bg-background px-5 py-4 text-start font-sans transition-colors duration-120 ease-standard hover:bg-surface ${tone.box}`}
-                      onClick={() => {
-                        captureUiEvent({ name: "project_starter_clicked", slot: index + 1 });
-                        captureUiEvent({
-                          name: "first_action",
-                          surface: telemetrySurface,
-                          action: "starter_click",
-                        });
-                        applyStarterPrompt(item.prompt);
-                      }}
-                    >
-                      <span className="flex items-center gap-2.5 text-base font-medium text-text">
-                        <Icon size={17} className={tone.icon} />
-                        {item.title}
-                      </span>
-                      <span className="w-full truncate text-sm text-subtext">{item.prompt}</span>
-                    </button>
+                    <div key={index} className="relative min-w-0">
+                      <button
+                        type="button"
+                        className={`flex h-full min-h-22 w-full min-w-0 cursor-pointer flex-col items-start justify-center gap-1.5 rounded-xl border bg-background py-4 ps-5 pe-11 text-start font-sans transition-colors duration-120 ease-standard hover:bg-surface ${tone.box}`}
+                        onClick={() => pickStarter(false)}
+                      >
+                        <span className="flex items-center gap-2.5 text-base font-medium text-text">
+                          <Icon size={17} className={tone.icon} />
+                          {item.title}
+                        </span>
+                        <span className="w-full truncate text-sm text-subtext">{item.prompt}</span>
+                      </button>
+                      <IconButton
+                        size="small"
+                        className="absolute end-2.5 top-2.5 [&:hover:not(:disabled)]:bg-surface-bright"
+                        aria-label={m.chat_panel_starter_edit({ title: item.title })}
+                        title={m.chat_panel_starter_edit({ title: item.title })}
+                        onClick={() => pickStarter(true)}
+                      >
+                        <Pencil size={13} />
+                      </IconButton>
+                    </div>
                   );
                 })}
               </div>
@@ -6713,8 +6798,10 @@ export function ChatPanel({
               role="note"
               className={`composer-demo-hint ${COMPOSER_HINT_CLASS}`}
             >
-              <FlaskConical size={16} className="shrink-0 text-primary" />
-              <span className="flex-1" dir="auto">{m.chat_panel_demo_hint_body()}</span>
+              <span className="flex-1" dir="auto">
+                <FlaskConical size={16} className="inline-block align-text-bottom me-2 text-primary" />
+                {m.chat_panel_demo_hint_body()}
+              </span>
               <IconButton
                 size="small"
                 aria-label={m.chat_panel_dismiss_demo_hint()}
@@ -6728,38 +6815,6 @@ export function ChatPanel({
               </IconButton>
             </div>
           )}
-          {demoRunningRunId && !demoRunHintDismissed && onOpenRun && (
-            <div
-              role="note"
-              className={`composer-demo-run-hint ${COMPOSER_HINT_CLASS}`}
-            >
-              <FlaskConical size={16} className="shrink-0 text-primary" />
-              <span className="flex flex-1 flex-wrap items-center gap-x-1.5 gap-y-1" dir="auto">
-                <span>{m.chat_panel_demo_run_hint_before()}</span>
-                <Button size="small" onClick={() => onOpenRun(demoRunningRunId, "keepOpen")}>
-                  <Terminal size={14} />
-                  {m.experiments_table_logs()}
-                </Button>
-                <span>{m.chat_panel_demo_run_hint_after()}</span>
-              </span>
-              <IconButton
-                size="small"
-                aria-label={m.chat_panel_dismiss_demo_hint()}
-                title={m.chat_panel_dismiss_demo_hint()}
-                onClick={() => {
-                  setDemoRunHintDismissed(true);
-                  composerRef.current?.focus();
-                }}
-              >
-                <X size={14} />
-              </IconButton>
-            </div>
-          )}
-          <span className="sr-only" role="status" aria-live="polite">
-            {demoRunningRunId
-              ? `${m.chat_panel_demo_run_hint_before()} ${m.experiments_table_logs()} ${m.chat_panel_demo_run_hint_after()}`
-              : ""}
-          </span>
           {!embedded && !activeId && onNewProject && (
             <ComposerProjectPicker
               projects={sidebarProjects}
@@ -6780,7 +6835,15 @@ export function ChatPanel({
                 ) : (
                   <>
                     <strong>{activeHarness.name} {m.chat_panel_is_unavailable()}</strong>{" "}
-                    {activeHarness.agentNote ? renderNote(activeHarness.agentNote) : m.chat_recheck_setup()}
+                    {activeHarness.agentNote
+                      ? renderNote(activeHarness.agentNote, onRunSetup && {
+                        canRun: (command) => setupPath(command) !== undefined,
+                        onRun: (command) => {
+                          const path = setupPath(command);
+                          if (path) onRunSetup(command, path);
+                        },
+                      })
+                      : m.chat_recheck_setup()}
                   </>
                 )}
               </div>
@@ -6791,6 +6854,14 @@ export function ChatPanel({
                 activeIndex={activeSkillIdx}
                 onPick={pickSkill}
                 onHover={setSkillIdx}
+              />
+            )}
+            {mentionMenuOpen && (
+              <FileMentionMenu
+                matches={mentionMatches}
+                activeIndex={activeMentionIdx}
+                onPick={pickFileMention}
+                onHover={setMentionIdx}
               />
             )}
             {resumeOpen && (
@@ -6848,9 +6919,9 @@ export function ChatPanel({
                 })}
               </div>
             )}
-            {attachError && (
+            {(imageInputError ?? attachError) && (
               <div className="composer-attach-error pt-1.5 px-3 pb-0 text-sm text-accent-red" role="alert">
-                {attachError}
+                {imageInputError ?? attachError}
               </div>
             )}
             {settingsError && (
@@ -6940,6 +7011,30 @@ export function ChatPanel({
                     if (e.key === "Tab" || e.key === "Enter") {
                       e.preventDefault();
                       pickSkill(skillMatches[activeSkillIdx]);
+                      return;
+                    }
+                    if (e.key === "Escape") {
+                      e.preventDefault();
+                      setSkillMenuDismissed(true);
+                      return;
+                    }
+                  }
+                  if (mentionMenuOpen && !e.nativeEvent.isComposing) {
+                    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                      e.preventDefault();
+                      const delta = e.key === "ArrowDown" ? 1 : -1;
+                      setMentionIdx(
+                        (activeMentionIdx + delta + mentionMatches.length) % mentionMatches.length,
+                      );
+                      return;
+                    }
+                    // A bare trailing `@` still sends on Enter; `@` is common in prose.
+                    if (
+                      e.key === "Tab"
+                      || (e.key === "Enter" && mentionQuery !== "" && !e.shiftKey && !e.metaKey && !e.ctrlKey)
+                    ) {
+                      e.preventDefault();
+                      pickFileMention(mentionMatches[activeMentionIdx]);
                       return;
                     }
                     if (e.key === "Escape") {
