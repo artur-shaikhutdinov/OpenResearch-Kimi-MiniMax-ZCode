@@ -19,22 +19,33 @@
   `/plan`. There is no Ask: MiniMax's own `default` mode ran commands outside
   the project without asking.
 - **ZCode**: uses the runtime bundled with the ZCode desktop app (or a `zcode`
-  CLI on PATH). Modes: Edit (the default), YOLO, and `/plan`. Print mode
-  cannot ask for approval, so there is no Ask. `/plan` runs in ZCode's
-  `build` mode, which then denies every tool with side effects (`Write`,
-  `Edit`, `Bash`, the Node REPL). The model is ZCode's default model.
+  CLI on PATH), driven through `zcode app-server --stdio`, the protocol the
+  ZCode app itself uses. Modes map onto ZCode's own:
+  - Ask is `build`: it asks before changes and commands.
+  - Edit is `edit`: file edits run, and it asks before commands.
+  - Auto (the default) is `guarded`: it asks only when there is risk.
+  - Full access is `yolo`.
+  - `/plan` is ZCode's read-only `plan` mode.
+
+  ZCode before 3.15 has no `guarded` mode, so Auto runs in `edit` there.
+
+  Approvals, AskUserQuestion and ExitPlanMode become orx's permission,
+  question and plan cards while the turn waits. An approved plan continues the
+  same turn in the composer's mode. Each chat runs on its own model
+  (`session/setModel`); the ZCode app's default model is left alone.
   - Signing in to the app is not enough: outside the app the runtime needs its
-    own sign-in, `zcode login` (Settings → Harnesses → ZCode → Sign in), which
-    saves the Coding Plan key and a default model. It covers the Z.ai
-    Individual Coding Plan. Alternatively enable a provider with an API key in
-    the app (Z.ai API billed from the balance, or Z.ai Coding Plan with an
-    active Coding Plan).
+    own sign-in, `zcode login` (Settings → Harnesses → ZCode → Sign in). Since
+    ZCode 3.15 it saves an OAuth token (`auth-source` `oauth`); earlier
+    versions saved the Coding Plan key. It covers the Z.ai Individual Coding
+    Plan. Alternatively enable a provider with an API key in the app (Z.ai API
+    billed from the balance, or Z.ai Coding Plan with an active Coding Plan).
   - Start Plan works only inside the app: its endpoint
     (`zcode.z.ai/api/v1/zcode-plan`) needs a captcha token the app obtains, and
     the Coding Plan endpoints answer `1113` for a Start Plan account.
   - On Windows `zcode login` opens the browser through `cmd /c start`, which
-    cuts the URL at its first `&`; orx runs `zcode login --no-browser` and
-    opens the printed URL itself.
+    cuts the URL at its first `&`; orx runs `zcode login --no-browser` through
+    PowerShell, which pipes its output (ZCode.exe is a GUI program and prints
+    nothing in a terminal) and opens the printed URL.
   - With no usable provider a turn fails with "Select a model before
     continuing"; a provider without a plan or balance fails with `1113`.
   - The runtime uses a plan only when its API key in `credentials.json` is
@@ -42,10 +53,7 @@
     with another account replaces the key, and turns fail with "Select a
     model"; orx then shows ZCode as not signed in and asks for `zcode login`.
   - The composer lists the models of each signed-in plan (from the app's
-    built-in provider catalog) and of each enabled API-key provider. Print
-    mode has no `--model`, so a new chat writes the chosen model to
-    `defaultModelSelection` in `provider_config.json`, which the app shares;
-    a resumed session keeps its model.
+    built-in provider catalog) and of each enabled API-key provider.
 
 The rest of this file is the integration notes.
 
@@ -61,7 +69,7 @@ account signed in. Windows install paths come from `scripts/probe-agents.ps1`.
 | Windows installer | `irm https://code.kimi.com/kimi-code/install.ps1 \| iex` | official PowerShell installer or npm | Desktop app; official CLI installs to `~/.zcode/runtime` |
 | Config home | `~/.kimi-code` | `~/.minimax` (`MINIMAX_DATA_DIR`) | `~/.zcode` (`ZCODE_DATA_BASE_DIR`); providers in `~/.zcode/v2/provider_config.json` |
 | Login | `kimi login` (device code; `--region global`) | `mcode login [--region global]` | `zcode login` (Z.AI OAuth) |
-| Planned transport | ACP (`kimi acp`) | ACP (`mcode acp`) | print mode (`zcode -p … --json`) |
+| Transport | ACP (`kimi acp`) | ACP (`mcode acp`) | ZCode Protocol (`zcode app-server --stdio`) |
 
 ## ACP (Kimi, MiniMax)
 
@@ -90,13 +98,38 @@ Print-mode fallbacks exist if ACP turns out to be unsuitable:
 
 ## ZCode
 
-- `zcode app-server` runs a proprietary "ZCode Protocol" over stdio:
-  `session/create`, `session/send`, `session/event` notifications,
-  `session/setMode`, `session/setModel`, `session/resume`, `session/compact`,
-  and so on. It is undocumented, and only a minified build is available.
-- `zcode -p <prompt> --json` is the documented headless path. It supports
-  `--resume sess_…`, `-c`, `--mode build|edit|yolo` (default `yolo` for
-  `-p`), `--cwd`, `--attach`, and `--disallowed-tools`.
+- `zcode app-server --stdio` speaks the ZCode Protocol: JSON-RPC-shaped
+  NDJSON without a `jsonrpc` field (a message carrying one is rejected).
+  Its schema is `packages/shared/src/zcode-protocol/index.ts` in
+  [zai-org/ZCode](https://github.com/zai-org/ZCode). A turn, as recorded in
+  `src/local/harness/fixtures/zcode_app_server_*.jsonl`:
+  1. `session/create {workspace, mode}` or `session/resume {sessionId,
+     workspace}` returns a snapshot. Its `settings` holds the current and
+     available models (with reasoning levels) and the mode.
+  2. `session/setMode`, then `session/setModel {model: {providerId, modelId,
+     options: {reasoningLevel}}, persistAsWorkspaceLastUsed: false}`. A model
+     with reasoning levels is refused without one.
+  3. `session/subscribe {deliveryKind: "desktop-continuous"}`, then
+     `session/send {content}`. Events arrive as `session/event` notifications,
+     the same events print mode streams, up to `turn.completed` or
+     `turn.failed`.
+  4. The server asks back:
+     - `session/requestRuntimePreferences` (answered with
+       `askUserQuestionAutoResolutionEnabled: false`, so questions reach the
+       user);
+     - `interaction/requestPermission` (answered with one option's
+       `response`, `{decision, reason}`);
+     - `interaction/requestUserInput` for AskUserQuestion (`{action: "accept",
+       content: {answers: {question: label}}}`) and for plan approval
+       (`schema.interaction: "plan_approval"`, approved with `{answer:
+       "approve"}`, any other answer is feedback).
+
+     While it waits, ZCode re-announces a request with a new id and the
+     same `requestId`.
+  5. `session/stop` ends the turn with `turn.completed` (`resultType:
+     "cancelled"`). orx instead closes the process, and the next turn resumes.
+- `zcode -p <prompt> --output-format stream-json` is the headless print
+  mode orx used before. It has no approval channel and no `--model`.
 - Without a provider, it exits 1 with `Model creation failed`.
 - **Open question:** does the Windows Desktop app ship a runnable `zcode`
   CLI, or only an Electron bundle? `probe-agents.ps1` answers this.

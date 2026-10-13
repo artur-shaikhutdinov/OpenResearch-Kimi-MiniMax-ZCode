@@ -1,41 +1,42 @@
 //! ZCode harness (Z.ai's coding agent).
 //!
-//! Chat: one `zcode -p <prompt> --output-format stream-json` child per turn,
-//! continued with `--resume <sessionId>`. The stream is one JSON event per
-//! line: `model.streaming` (text, reasoning and tool-call deltas),
-//! `tool.updated` (tool results), `permission.resolved`, and a closing
-//! `turn.completed` or `turn.failed`.
+//! Chat: one `zcode app-server --stdio` child per turn, speaking the ZCode
+//! Protocol (JSON-RPC-shaped NDJSON without the `jsonrpc` field). The turn
+//! creates or resumes the native session, moves it onto the composer's mode
+//! and model, subscribes, and sends one message. The session's events
+//! (`model.streaming`, `tool.updated`, `permission.resolved`, …) arrive as
+//! `session/event` notifications until `turn.completed` or `turn.failed`.
 //!
-//! Print mode has no approval channel: in `build`/`edit` mode ZCode denies
-//! high-risk tools itself ("No permission client configured"). So the
-//! composer offers `edit` (edits allowed, risky commands denied; the default)
-//! and `yolo` (everything allowed). Plan runs in `build`, where every tool
-//! with side effects needs approval and so is denied: `Write`, `Edit`, every
-//! `Bash` command, and the Node REPL. The planning instruction only asks for
-//! a plan; the mode is what keeps the turn read-only.
+//! The composer's modes are ZCode's own: Ask is `build`, Edit is `edit`, Auto
+//! is `guarded` (ask when there is risk), Full access is `yolo`, and Plan is
+//! ZCode's read-only `plan`. ZCode's approvals, AskUserQuestion and plan
+//! approval (ExitPlanMode) come back as requests that orx shows as cards while
+//! the turn waits ([`crate::local::chat::ChatHost::request_permission`]).
 //!
 //! Detection: a `zcode` CLI (official `~/.zcode/runtime` install, npm, PATH),
 //! else the runtime bundled with the ZCode desktop app (`resources/glm/zcode.cjs`)
 //! run through the app's own Electron binary as Node (`ELECTRON_RUN_AS_NODE=1`).
 //! The desktop login in `~/.zcode/v2` is shared with both.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use serde_json::{json, Value};
 use tokio::process::Command;
 
+use super::acp::{Connection, Inbound, RpcError, RpcResult};
 use super::detect::{HarnessAuthState, HarnessInfo, ModelInfo};
 use super::options::{HarnessOptions, OptionChoice, PermissionMode, PlanActivation};
 use super::{Harness, ResumeAction, TurnFailure, TurnOutcome, TurnResult, TURN_WATCHDOG};
 use crate::error::{anyhow, Result};
 use crate::local::chat::{
-    find_part_mut, harness_log, prepare_env, set_chat_session_env, DeliveryState, PromptAnswer,
-    ResumeCtx, TurnCtx, WirePart, WirePrompt, WireToolState,
+    find_part_mut, harness_log, prepare_env, set_chat_session_env, DeliveryState,
+    PermissionDecision, PromptAnswer, ResumeCtx, TurnCtx, WirePart, WirePrompt, WireToolState,
 };
 use crate::local::opencode::ensure_playbook;
 use crate::local::shell_env::{find_in_dir, find_on_path};
@@ -407,50 +408,6 @@ fn catalog(home: &Path, builtin: Option<&Path>) -> Vec<ModelInfo> {
         .collect()
 }
 
-/// Held by a new chat from writing ZCode's default model until its runtime has
-/// read it, so chats started together do not run on each other's model.
-static MODEL_SELECTION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Whether `event` shows the runtime has settled on its model (or ended), so
-/// the shared default model may change again.
-fn model_settled(event: &Value) -> bool {
-    matches!(
-        event.get("type").and_then(Value::as_str),
-        Some("turn.completed" | "turn.failed")
-    ) || event.pointer("/payload/modelId").is_some()
-}
-
-/// Make `provider/model` ZCode's default model, which is the only model
-/// choice its print mode reads. The default is shared with the ZCode app.
-fn select_model(home: &Path, model: &str) -> Result<()> {
-    let Some((provider, model)) = model.split_once('/') else {
-        return Err(anyhow!("Unknown ZCode model {model}"));
-    };
-    let path = home.join("v2").join("provider_config.json");
-    let mut config = super::detect::read_json(path.clone()).unwrap_or_else(|| {
-        serde_json::json!({
-            "schemaVersion": 1,
-            "config": {
-                "providerConfigRules": {"providerRules": []},
-                "modelConfigRules": {"providerModelRules": [], "manualProviderModelRules": []},
-            },
-        })
-    });
-    let selection = serde_json::json!({"providerId": provider, "modelId": model});
-    let Some(settings) = config.get_mut("config").and_then(Value::as_object_mut) else {
-        return Err(anyhow!("{} has no config object", path.display()));
-    };
-    if settings.get("defaultModelSelection") == Some(&selection) {
-        return Ok(());
-    }
-    settings.insert("defaultModelSelection".into(), selection);
-    let tmp = path.with_extension(format!("json.orx-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(path.parent().unwrap())?;
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&config)?)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
-}
-
 /// The key ZCode encrypts credentials.json with: SHA-256 of
 /// `ZCODE_CREDENTIAL_SECRET`, else of a fallback built from the platform,
 /// home directory and user name, as Node reports them.
@@ -622,14 +579,16 @@ impl Harness for ZCode {
     fn options(&self) -> HarnessOptions {
         HarnessOptions::none().with_permission_choices(
             vec![
+                OptionChoice::described("ask", "Ask", "Ask before changes and commands"),
                 OptionChoice::described(
                     "accept-edits",
                     "Edit",
-                    "Allow file edits; ZCode denies high-risk commands",
+                    "Allow file edits; ask before commands",
                 ),
-                OptionChoice::described("bypass", "YOLO", "Allow every tool"),
+                OptionChoice::described("auto", "Auto", "Ask only when there is risk"),
+                OptionChoice::described("bypass", "Full access", "Allow every tool"),
             ],
-            "accept-edits",
+            "auto",
             PlanActivation::Command,
         )
     }
@@ -640,7 +599,7 @@ impl Harness for ZCode {
         prompt: &WirePrompt,
         answer: &PromptAnswer,
     ) -> Result<ResumeAction> {
-        super::acp::resume_from_prompt(ctx, prompt, answer).await
+        resume_from_prompt(ctx, prompt, answer).await
     }
 
     fn config_home(&self) -> Option<PathBuf> {
@@ -665,31 +624,419 @@ impl Harness for ZCode {
     }
 }
 
+/// ZCode's mode for the composer's permission mode. Plan is ZCode's own
+/// read-only mode, left through its plan approval (ExitPlanMode).
 fn zcode_mode(mode: Option<PermissionMode>, plan: bool) -> &'static str {
     if plan || mode == Some(PermissionMode::Plan) {
-        return "build";
+        return "plan";
     }
-    match mode.unwrap_or(PermissionMode::AcceptEdits) {
-        PermissionMode::Bypass => "yolo",
+    match mode.unwrap_or(PermissionMode::Auto) {
         PermissionMode::Ask => "build",
-        PermissionMode::AcceptEdits | PermissionMode::Auto | PermissionMode::Plan => "edit",
+        PermissionMode::AcceptEdits => "edit",
+        PermissionMode::Auto | PermissionMode::Plan => "guarded",
+        PermissionMode::Bypass => "yolo",
     }
 }
 
-const PLAN_NOTE: &str = "Plan mode: investigate read-only and reply with a concrete plan. Do not modify files or run commands that change state.";
+/// ZCode before 3.15 has no `guarded` mode (its `auto` is a stub that denies
+/// every tool). `edit` is the nearest: edits run, anything else asks.
+const GUARDED_FALLBACK: &str = "edit";
 
-fn turn_prompt(text: &str, first: bool, plan: bool) -> String {
-    let mut prompt = String::new();
+fn turn_prompt(text: &str, first: bool) -> String {
     if first {
-        prompt.push_str(&super::acp::playbook_pointer());
-        prompt.push_str("\n\n");
+        format!("{}\n\n{text}", super::acp::playbook_pointer())
+    } else {
+        text.to_string()
     }
-    if plan {
-        prompt.push_str(PLAN_NOTE);
-        prompt.push_str("\n\n");
+}
+
+/// What ZCode's runtime asks the client while it waits for preferences;
+/// the defaults of ZCode's own desktop app, except that questions always
+/// reach the user.
+fn runtime_preferences() -> Value {
+    json!({
+        "nativeSearchEnhancementsEnabled": false,
+        "memoryEnabled": false,
+        "askUserQuestionAutoResolutionEnabled": false,
+    })
+}
+
+/// Something ZCode asks the user mid-turn, as orx shows it.
+#[derive(Debug, Clone, PartialEq)]
+enum Ask {
+    /// A tool approval, answered with one of ZCode's own options.
+    Permission {
+        tool: String,
+        input: Value,
+        options: Vec<Value>,
+    },
+    /// AskUserQuestion, answered with the chosen option labels.
+    Question { input: Value, question: String },
+    /// ExitPlanMode: approve the plan, revise it, or stay in plan mode.
+    Plan { plan: String },
+}
+
+impl Ask {
+    /// The request ZCode sent, if orx can show it.
+    fn of(method: &str, params: &Value) -> Option<Self> {
+        let input = params.get("input").cloned().unwrap_or_else(|| json!({}));
+        let tool = params.get("toolName").and_then(Value::as_str);
+        match method {
+            "interaction/requestPermission" => Some(Ask::Permission {
+                tool: tool.unwrap_or("Tool").to_string(),
+                input,
+                options: params
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+            }),
+            "interaction/requestUserInput"
+                if params
+                    .pointer("/schema/interaction")
+                    .and_then(Value::as_str)
+                    == Some("plan_approval") =>
+            {
+                Some(Ask::Plan {
+                    plan: input
+                        .get("plan")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                })
+            }
+            "interaction/requestUserInput" if tool == Some("AskUserQuestion") => {
+                let question = input
+                    .pointer("/questions/0/question")
+                    .and_then(Value::as_str)?
+                    .to_string();
+                Some(Ask::Question { input, question })
+            }
+            _ => None,
+        }
     }
-    prompt.push_str(text);
-    prompt
+
+    /// The tool name and input of orx's card (`ChatHost::request_permission`
+    /// turns ExitPlanMode into a plan card and AskUserQuestion into a
+    /// question card).
+    fn card(&self) -> (&str, Value) {
+        match self {
+            Ask::Permission { tool, input, .. } => (tool, input.clone()),
+            Ask::Question { input, .. } => ("AskUserQuestion", input.clone()),
+            Ask::Plan { plan } => ("ExitPlanMode", json!({ "plan": plan })),
+        }
+    }
+
+    /// ZCode's answer for the user's decision. A plan card's Allow carries
+    /// `{"feedback": …}` when the user asked for a revision, and a question
+    /// card's carries `{"answers": {question: answer}}` (see
+    /// `resume_from_prompt`).
+    fn reply(&self, decision: &PermissionDecision) -> Value {
+        match (self, decision) {
+            (Ask::Permission { options, .. }, PermissionDecision::Allow { .. }) => {
+                let allows = |option: &&Value| {
+                    option.pointer("/response/decision").and_then(Value::as_str) == Some("allow")
+                };
+                options
+                    .iter()
+                    .filter(allows)
+                    .find(|option| option.get("kind").and_then(Value::as_str) == Some("allow_once"))
+                    .or_else(|| options.iter().find(allows))
+                    .and_then(|option| option.get("response").cloned())
+                    .unwrap_or_else(|| json!({ "decision": "allow" }))
+            }
+            (Ask::Permission { .. }, PermissionDecision::Deny { message }) => {
+                json!({ "decision": "deny", "reason": message })
+            }
+            (Ask::Question { .. }, PermissionDecision::Allow { updated_input }) => {
+                match updated_input
+                    .as_ref()
+                    .and_then(|input| input.get("answers"))
+                {
+                    Some(answers) => {
+                        json!({ "action": "accept", "content": { "answers": answers } })
+                    }
+                    None => json!({ "action": "decline" }),
+                }
+            }
+            (Ask::Plan { .. }, PermissionDecision::Allow { updated_input }) => {
+                let answer = updated_input
+                    .as_ref()
+                    .and_then(|input| input.get("feedback"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(PLAN_APPROVE);
+                json!({ "action": "accept", "content": { "answer": answer } })
+            }
+            (Ask::Question { .. } | Ask::Plan { .. }, PermissionDecision::Deny { .. }) => {
+                json!({ "action": "decline" })
+            }
+        }
+    }
+}
+
+/// The answer that approves a plan; any other answer is feedback on it.
+const PLAN_APPROVE: &str = "approve";
+
+/// ZCode re-announces a request it is still waiting on (a new protocol id,
+/// the same `requestId`). One card answers all of them.
+#[derive(Default)]
+struct Asks {
+    waiting: HashMap<String, Vec<Value>>,
+    answered: HashMap<String, Value>,
+}
+
+#[derive(Default)]
+struct TurnState {
+    session_id: Option<String>,
+    text_part: Option<(String, String)>,
+    reasoning_part: Option<(String, String)>,
+    completed: bool,
+    failure: Option<String>,
+    /// ZCode asked for plan approval this turn, so its plan has a card.
+    plan_asked: bool,
+}
+
+/// One turn's connection to `zcode app-server --stdio`.
+struct Turn<'a> {
+    conn: &'a Connection,
+    inbound: &'a mut tokio::sync::mpsc::UnboundedReceiver<Inbound>,
+    state: TurnState,
+    asks: Arc<Mutex<Asks>>,
+    gate_token: String,
+    /// The mode a plan approval hands the session to.
+    after_plan: &'static str,
+}
+
+impl Turn<'_> {
+    /// Send a request and wait for its answer, handling ZCode's own messages
+    /// meanwhile.
+    async fn call(&mut self, ctx: &mut TurnCtx, method: &str, params: Value) -> Result<RpcResult> {
+        let mut rx = self.conn.send(method, params).await?;
+        loop {
+            tokio::select! {
+                biased;
+                message = self.inbound.recv() => {
+                    let Some(message) = message else {
+                        return Ok(rx.try_recv().unwrap_or_else(|_| Err(exited())));
+                    };
+                    self.handle(ctx, message).await?;
+                    ctx.maybe_flush();
+                }
+                response = &mut rx => return Ok(response.unwrap_or_else(|_| Err(exited()))),
+                _ = tokio::time::sleep(TURN_WATCHDOG) => {
+                    if !ctx.host.has_pending_permission(&ctx.session_id) {
+                        return Err(silent());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle ZCode's messages until the turn completes or fails.
+    async fn finish(&mut self, ctx: &mut TurnCtx) -> Result<()> {
+        while !self.state.completed && self.state.failure.is_none() {
+            match tokio::time::timeout(TURN_WATCHDOG, self.inbound.recv()).await {
+                Ok(Some(message)) => {
+                    self.handle(ctx, message).await?;
+                    ctx.maybe_flush();
+                }
+                Ok(None) => return Err(anyhow!("ZCode exited before the turn finished")),
+                Err(_) if ctx.host.has_pending_permission(&ctx.session_id) => {}
+                Err(_) => return Err(silent()),
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle(&mut self, ctx: &mut TurnCtx, message: Inbound) -> Result<()> {
+        match message {
+            Inbound::Notification { method, params } if method == "session/event" => {
+                ctx.mark_delivery(DeliveryState::Accepted);
+                apply_event(ctx, &mut self.state, &params);
+                if let Some(sid) = self.state.session_id.as_deref() {
+                    ctx.set_native_session_id(sid);
+                }
+            }
+            Inbound::Notification { .. } => {}
+            Inbound::Request { id, method, .. }
+                if method == "session/requestRuntimePreferences" =>
+            {
+                self.conn.respond(id, runtime_preferences()).await?;
+            }
+            Inbound::Request { id, method, params } => match Ask::of(&method, &params) {
+                Some(ask) => self.ask(ctx, id, &params, ask).await?,
+                None => {
+                    // An unknown interaction answered "no" lets ZCode go on.
+                    self.conn
+                        .respond_error(
+                            id,
+                            -32601,
+                            &format!("{method} is not supported by OpenResearch"),
+                        )
+                        .await?
+                }
+            },
+        }
+        Ok(())
+    }
+
+    /// Show the user a card for `ask`; its answer arrives on a background task
+    /// while the turn keeps streaming.
+    async fn ask(&mut self, ctx: &TurnCtx, id: Value, params: &Value, ask: Ask) -> Result<()> {
+        let request = params
+            .get("requestId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| id.to_string());
+        let answered = {
+            let mut asks = self.asks.lock().unwrap();
+            match asks.answered.get(&request).cloned() {
+                Some(reply) => Some((id, reply)),
+                None => {
+                    let waiting = asks.waiting.entry(request.clone()).or_default();
+                    waiting.push(id);
+                    if waiting.len() > 1 {
+                        return Ok(());
+                    }
+                    None
+                }
+            }
+        };
+        if let Some((id, reply)) = answered {
+            return self.conn.respond(id, reply).await;
+        }
+        if matches!(ask, Ask::Plan { .. }) {
+            self.state.plan_asked = true;
+        }
+        let host = ctx.host.clone();
+        let session_id = ctx.session_id.clone();
+        let native_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let token = self.gate_token.clone();
+        let conn = self.conn.clone();
+        let asks = self.asks.clone();
+        let after_plan = self.after_plan;
+        tokio::spawn(async move {
+            let (tool, input) = ask.card();
+            let decision = host
+                .request_permission(&session_id, &token, tool, input)
+                .await
+                .unwrap_or_else(|error| PermissionDecision::Deny {
+                    message: error.to_string(),
+                });
+            let reply = ask.reply(&decision);
+            let ids = {
+                let mut asks = asks.lock().unwrap();
+                asks.answered.insert(request.clone(), reply.clone());
+                asks.waiting.remove(&request).unwrap_or_default()
+            };
+            for id in ids {
+                let _ = conn.respond(id, reply.clone()).await;
+            }
+            // An approved plan leaves ZCode in `build`; continue in the
+            // composer's own mode instead.
+            let approved = matches!(ask, Ask::Plan { .. })
+                && reply.pointer("/content/answer").and_then(Value::as_str) == Some(PLAN_APPROVE);
+            if let (true, Some(native_id)) = (approved, native_id) {
+                let _ = conn
+                    .send(
+                        "session/setMode",
+                        json!({"sessionId": native_id, "mode": after_plan}),
+                    )
+                    .await;
+            }
+        });
+        Ok(())
+    }
+
+    /// Set the session's mode, falling back from `guarded` on a ZCode that
+    /// lacks it.
+    async fn set_mode(&mut self, ctx: &mut TurnCtx, session: &str, mode: &str) -> Result<()> {
+        let mut result = self
+            .call(
+                ctx,
+                "session/setMode",
+                json!({"sessionId": session, "mode": mode}),
+            )
+            .await?;
+        if result.is_err() && mode == "guarded" {
+            result = self
+                .call(
+                    ctx,
+                    "session/setMode",
+                    json!({"sessionId": session, "mode": GUARDED_FALLBACK}),
+                )
+                .await?;
+        }
+        result.map(|_| ()).map_err(|error| {
+            anyhow!(
+                "ZCode could not switch to the chosen mode, so the message was not sent: {error}"
+            )
+        })
+    }
+}
+
+fn exited() -> RpcError {
+    RpcError {
+        code: 0,
+        message: "ZCode exited".into(),
+    }
+}
+
+fn silent() -> crate::error::Error {
+    anyhow!(
+        "ZCode went silent for {} minutes and was interrupted.",
+        TURN_WATCHDOG.as_secs() / 60
+    )
+}
+
+/// The `session/setModel` selection that moves a session onto the composer's
+/// model (`provider/model`) at `reasoning`, else the model's default level;
+/// `None` when the session already runs it. `settings` is the session
+/// snapshot's.
+fn model_selection(settings: &Value, wanted: &str, reasoning: Option<&str>) -> Option<Value> {
+    let (provider, model) = wanted.split_once('/')?;
+    let offered = settings
+        .pointer("/model/available")
+        .and_then(Value::as_array)
+        .and_then(|all| {
+            all.iter().find(|entry| {
+                entry.pointer("/ref/providerId").and_then(Value::as_str) == Some(provider)
+                    && entry.pointer("/ref/modelId").and_then(Value::as_str) == Some(model)
+            })
+        });
+    let levels: Vec<&str> = offered
+        .and_then(|entry| entry.pointer("/reasoning/levels"))
+        .and_then(Value::as_array)
+        .map(|levels| {
+            levels
+                .iter()
+                .filter_map(|level| level.get("value").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    let level = reasoning
+        .filter(|level| levels.contains(level))
+        .or_else(|| {
+            offered
+                .and_then(|entry| entry.pointer("/reasoning/defaultLevel"))
+                .and_then(Value::as_str)
+        });
+    let mut selection = json!({"providerId": provider, "modelId": model});
+    if let Some(level) = level {
+        selection["options"] = json!({ "reasoningLevel": level });
+    }
+    let current = settings.pointer("/model/current");
+    let same = current.and_then(|c| c.get("providerId")) == selection.get("providerId")
+        && current.and_then(|c| c.get("modelId")) == selection.get("modelId")
+        && (level.is_none()
+            || current
+                .and_then(|c| c.pointer("/options/reasoningLevel"))
+                .and_then(Value::as_str)
+                == level);
+    (!same).then_some(selection)
 }
 
 async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
@@ -702,32 +1049,11 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     .await
     .map_err(|e| anyhow!("playbook task failed: {e}"))??;
 
-    let resume = ctx.native_session_id.clone();
-    // A new session starts on ZCode's default model; a resumed one keeps its own.
-    let mut selection = match resume {
-        None => Some(MODEL_SELECTION.lock().await),
-        Some(_) => None,
-    };
-    if let (None, Some(model), Some(home)) = (&resume, ctx.model.as_deref(), zcode_home()) {
-        select_model(&home, model)
-            .map_err(|error| anyhow!("Could not select {model} in ZCode: {error}"))?;
-    }
-    let plan = ctx.plan_mode || ctx.permission_mode == Some(PermissionMode::Plan);
-    let prompt = turn_prompt(&ctx.text, resume.is_none(), plan);
-
     let log_name = format!("zcode-{}", uuid::Uuid::new_v4());
     let mut cmd = launch.command();
-    cmd.arg("-p")
-        .arg(&prompt)
-        .args(["--output-format", "stream-json", "--no-color", "--mode"])
-        .arg(zcode_mode(ctx.permission_mode, ctx.plan_mode))
-        .arg("--cwd")
-        .arg(&repo);
-    if let Some(native_id) = &resume {
-        cmd.args(["--resume", native_id]);
-    }
-    cmd.current_dir(&repo)
-        .stdin(Stdio::null())
+    cmd.args(["app-server", "--stdio"])
+        .current_dir(&repo)
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(harness_log(&log_name)?))
         .kill_on_drop(true);
@@ -752,68 +1078,216 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
         }
     };
     let _processes = super::antigravity::TurnProcesses(child.id());
+    let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
     let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
-    let mut lines = BufReader::new(stdout).lines();
-    let mut state = TurnState::default();
+    let (conn, mut inbound, reader) = super::acp::connect(stdin, stdout, false);
+    let log_path = crate::store::data_dir().join(format!("agent-{log_name}.log"));
+    let outcome = drive(ctx, &conn, &mut inbound, &repo).await;
+    reader.abort();
+    // Closing stdin ends the app-server.
+    drop(conn);
+    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    match outcome {
+        Ok(failure) => {
+            if let Some(message) = failure {
+                ctx.mark_terminal_failure("zcode_turn_failed", explain_failure(message, &log_path));
+            } else {
+                let _ = std::fs::remove_file(&log_path);
+            }
+            let _ = ctx.flush();
+            Ok(())
+        }
+        Err(error) => Err(anyhow!("{error} (log: {})", log_path.display())),
+    }
+}
 
-    loop {
-        match tokio::time::timeout(TURN_WATCHDOG, lines.next_line()).await {
-            Ok(Ok(Some(line))) => {
-                let Ok(event) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                ctx.mark_delivery(DeliveryState::Accepted);
-                if selection.is_some() && model_settled(&event) {
-                    selection = None;
-                }
-                apply_event(ctx, &mut state, &event);
-                if let Some(sid) = state.session_id.as_deref() {
-                    ctx.set_native_session_id(sid);
-                }
-                ctx.maybe_flush();
-            }
-            Ok(Ok(None)) => break,
-            Ok(Err(error)) => return Err(anyhow!("zcode stdout: {error}")),
-            Err(_) => {
-                return Err(anyhow!(
-                    "ZCode went silent for {} minutes and was interrupted.",
-                    TURN_WATCHDOG.as_secs() / 60
-                ))
-            }
+/// Open (or resume) the session, bring it to the composer's mode and model,
+/// and run one message. Returns ZCode's own failure message, if the turn
+/// failed.
+async fn drive(
+    ctx: &mut TurnCtx,
+    conn: &Connection,
+    inbound: &mut tokio::sync::mpsc::UnboundedReceiver<Inbound>,
+    repo: &Path,
+) -> Result<Option<String>> {
+    let plan = ctx.plan_mode || ctx.permission_mode == Some(PermissionMode::Plan);
+    let mode = zcode_mode(ctx.permission_mode, plan);
+    let bypass = mode == "yolo";
+    let mut turn = Turn {
+        conn,
+        inbound,
+        state: TurnState::default(),
+        asks: Arc::default(),
+        gate_token: ctx.host.mint_gate_token(&ctx.session_id, plan, bypass),
+        after_plan: zcode_mode(
+            ctx.permission_mode.filter(|m| *m != PermissionMode::Plan),
+            false,
+        ),
+    };
+    let path = repo.to_string_lossy().into_owned();
+    let workspace = json!({"workspacePath": path, "workspaceKey": path});
+
+    let mut opened = None;
+    if let Some(native) = ctx.native_session_id.clone() {
+        // A session ZCode no longer has starts over; orx keeps the transcript.
+        if let Ok(snapshot) = turn
+            .call(
+                ctx,
+                "session/resume",
+                json!({"sessionId": native, "workspace": workspace}),
+            )
+            .await?
+        {
+            turn.set_mode(ctx, &native, mode).await?;
+            opened = Some((native, snapshot));
         }
     }
-    let status = tokio::time::timeout(Duration::from_secs(30), child.wait())
-        .await
-        .map_err(|_| anyhow!("ZCode did not exit after its response"))??;
-    let log_path = crate::store::data_dir().join(format!("agent-{log_name}.log"));
-    if let Some(message) = state.failure.take() {
-        ctx.mark_terminal_failure("zcode_turn_failed", explain_failure(message, &log_path));
-    } else if !state.completed {
-        let detail = std::fs::read_to_string(&log_path)
-            .ok()
-            .and_then(|log| {
-                log.lines()
-                    .rev()
-                    .find(|l| !l.trim().is_empty())
-                    .map(str::to_string)
-            })
-            .unwrap_or_default();
-        return Err(anyhow!(
-            "ZCode ended without a result ({status}). {detail} (log: {})",
-            log_path.display()
-        ));
-    } else {
-        let _ = std::fs::remove_file(&log_path);
+    let resumed = opened.is_some();
+    let (session, snapshot) = match opened {
+        Some(opened) => opened,
+        None => {
+            let create = |mode: &str| json!({"workspace": workspace, "mode": mode});
+            let mut created = turn.call(ctx, "session/create", create(mode)).await?;
+            if created.is_err() && mode == "guarded" {
+                created = turn
+                    .call(ctx, "session/create", create(GUARDED_FALLBACK))
+                    .await?;
+            }
+            let snapshot =
+                created.map_err(|error| anyhow!("ZCode could not start a session: {error}"))?;
+            let session = snapshot
+                .pointer("/session/sessionId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("ZCode started a session without an id"))?
+                .to_string();
+            (session, snapshot)
+        }
+    };
+    ctx.set_native_session_id(&session);
+
+    if let Some(model) = ctx.model.clone() {
+        let settings = snapshot.get("settings").cloned().unwrap_or(Value::Null);
+        if let Some(selection) = model_selection(&settings, &model, ctx.reasoning_level.as_deref())
+        {
+            turn.call(
+                ctx,
+                "session/setModel",
+                json!({"sessionId": session, "model": selection, "persistAsWorkspaceLastUsed": false}),
+            )
+            .await?
+            .map_err(|error| anyhow!("ZCode could not switch to {model}, so the message was not sent: {error}"))?;
+        }
     }
-    if plan {
+    turn.call(
+        ctx,
+        "session/subscribe",
+        json!({"sessionId": session, "deliveryKind": "desktop-continuous"}),
+    )
+    .await?
+    .map_err(|error| anyhow!("ZCode did not stream the session: {error}"))?;
+    turn.call(
+        ctx,
+        "session/send",
+        json!({"sessionId": session, "content": turn_prompt(&ctx.text, !resumed)}),
+    )
+    .await?
+    .map_err(|error| {
+        ctx.mark_delivery(DeliveryState::NotSent);
+        anyhow!("ZCode did not accept the message: {error}")
+    })?;
+    ctx.mark_delivery(DeliveryState::Accepted);
+    turn.finish(ctx).await?;
+
+    // ZCode's plan mode ends a turn without asking for approval when the
+    // model writes its plan as text; that plan still needs a card.
+    if plan && !turn.state.plan_asked {
         if let Some(card) =
             super::acp::synthesized_plan_card(&ctx.assistant.parts, &ctx.assistant.id)
         {
             ctx.upsert_part(card);
         }
     }
-    let _ = ctx.flush();
-    Ok(())
+    Ok(turn.state.failure.take())
+}
+
+/// Answer a card ZCode is waiting on inside the running turn: a tool
+/// approval, a plan approval (ExitPlanMode) or a question (AskUserQuestion).
+/// End-turn plan cards (a plan written as text) continue with a new message.
+async fn resume_from_prompt(
+    ctx: &ResumeCtx,
+    prompt: &WirePrompt,
+    answer: &PromptAnswer,
+) -> Result<ResumeAction> {
+    let Some(native_id) = &prompt.native_id else {
+        return super::acp::resume_from_prompt(ctx, prompt, answer).await;
+    };
+    if !ctx.is_busy().await {
+        ctx.host
+            .resolve_zombie_prompt(&ctx.session_id, &answer.prompt_id);
+        return Err(anyhow!("this approval is no longer pending"));
+    }
+    let note = answer
+        .note
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty());
+    let (decision, plan_mode) = match (prompt.kind.as_str(), answer.approve) {
+        ("permission", true) => (
+            PermissionDecision::Allow {
+                updated_input: prompt.tool_input.clone(),
+            },
+            None,
+        ),
+        ("permission", false) => (
+            PermissionDecision::Deny {
+                message: match note {
+                    Some(note) => format!(
+                        "The user denied this action: {note}. Do not retry it; adjust course."
+                    ),
+                    None => "The user denied this action. Do not retry it; adjust course.".into(),
+                },
+            },
+            None,
+        ),
+        // ZCode leaves plan mode itself and implements in the same turn.
+        ("plan", true) => (
+            PermissionDecision::Allow {
+                updated_input: None,
+            },
+            Some(false),
+        ),
+        // A note asks ZCode to revise the plan; none rejects it.
+        ("plan", false) => match note {
+            Some(note) => (
+                PermissionDecision::Allow {
+                    updated_input: Some(json!({ "feedback": note })),
+                },
+                None,
+            ),
+            None => (
+                PermissionDecision::Deny {
+                    message: "The user rejected this plan.".into(),
+                },
+                None,
+            ),
+        },
+        ("question", _) => {
+            let text = answer.contextualized_answer(answer.plain_answer_text());
+            if text.trim().is_empty() {
+                return Err(anyhow!("select an option (or add a note) to answer"));
+            }
+            let question = prompt.question.clone().unwrap_or_default();
+            (
+                PermissionDecision::Allow {
+                    updated_input: Some(json!({ "answers": { question: text } })),
+                },
+                None,
+            )
+        }
+        _ => return Err(anyhow!("unsupported prompt kind for a ZCode card")),
+    };
+    ctx.host.settle_permission(native_id, decision)?;
+    Ok(ResumeAction::Handled { plan_mode })
 }
 
 /// ZCode's own wording for a turn that found no model says nothing about why.
@@ -843,15 +1317,6 @@ fn explain_failure(message: String, log_path: &Path) -> String {
     message
 }
 
-#[derive(Default)]
-struct TurnState {
-    session_id: Option<String>,
-    text_part: Option<(String, String)>,
-    reasoning_part: Option<(String, String)>,
-    completed: bool,
-    failure: Option<String>,
-}
-
 fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) {
     if let Some(sid) = event.get("sessionId").and_then(Value::as_str) {
         if state.session_id.as_deref() != Some(sid) {
@@ -874,7 +1339,7 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) {
                         .and_then(|part| part.state.as_mut())
                     {
                         part_state.status = "error".into();
-                        part_state.error = Some(format!("ZCode denied this tool: {reason}"));
+                        part_state.error = Some(format!("Denied: {reason}"));
                     }
                 }
             }
@@ -884,7 +1349,7 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) {
             if let Some(title) = payload
                 .get("title")
                 .and_then(Value::as_str)
-                .and_then(|title| super::acp::agent_title(title, &[&pointer, PLAN_NOTE]))
+                .and_then(|title| super::acp::agent_title(title, &[&pointer]))
             {
                 ctx.set_title(title);
             }
@@ -1109,17 +1574,225 @@ mod tests {
 
     #[test]
     fn composer_modes_map_onto_zcode_modes() {
-        // A chat with no mode chosen gets Edit, never YOLO.
-        assert_eq!(zcode_mode(None, false), "edit");
-        assert_eq!(
-            ZCode.options().default_permission_mode,
-            Some("accept-edits")
-        );
+        // A chat with no mode chosen gets ZCode's risk-based mode, never YOLO.
+        assert_eq!(zcode_mode(None, false), "guarded");
+        assert_eq!(ZCode.options().default_permission_mode, Some("auto"));
+        assert_eq!(zcode_mode(Some(PermissionMode::Ask), false), "build");
         assert_eq!(zcode_mode(Some(PermissionMode::AcceptEdits), false), "edit");
+        assert_eq!(zcode_mode(Some(PermissionMode::Auto), false), "guarded");
         assert_eq!(zcode_mode(Some(PermissionMode::Bypass), false), "yolo");
-        // Plan turns run in `build`, whatever mode the composer had.
-        assert_eq!(zcode_mode(Some(PermissionMode::Bypass), true), "build");
-        assert_eq!(zcode_mode(Some(PermissionMode::Plan), false), "build");
+        // Plan is ZCode's own plan mode, whatever mode the composer had.
+        assert_eq!(zcode_mode(Some(PermissionMode::Bypass), true), "plan");
+        assert_eq!(zcode_mode(Some(PermissionMode::Plan), false), "plan");
+    }
+
+    /// A recorded `zcode app-server --stdio` exchange: what orx sent (`>>`)
+    /// and what ZCode sent (`<<`).
+    fn exchange(fixture: &str) -> Vec<(bool, Value)> {
+        fixture
+            .lines()
+            .map(|line| {
+                let (sent, body) = match line.split_at(3) {
+                    (">> ", body) => (true, body),
+                    ("<< ", body) => (false, body),
+                    _ => panic!("fixture line without direction: {line}"),
+                };
+                (
+                    sent,
+                    serde_json::from_str(body).expect("fixture line is JSON"),
+                )
+            })
+            .collect()
+    }
+
+    /// ZCode's first request of `method`, and the answer recorded for it.
+    fn request_and_answer(fixture: &str, method: &str) -> (Value, Value) {
+        let messages = exchange(fixture);
+        let request = messages
+            .iter()
+            .find(|(sent, m)| !sent && m.get("method").and_then(Value::as_str) == Some(method))
+            .map(|(_, m)| m.clone())
+            .expect("fixture has the request");
+        let answer = messages
+            .iter()
+            .find(|(sent, m)| {
+                *sent && m.get("id") == request.get("id") && m.get("result").is_some()
+            })
+            .map(|(_, m)| m["result"].clone())
+            .expect("fixture has the answer");
+        (request["params"].clone(), answer)
+    }
+
+    #[test]
+    fn folds_an_app_server_turn() {
+        let fixture = include_str!("fixtures/zcode_app_server_permission.jsonl");
+        let mut ctx = TurnCtx::test_stub();
+        let mut state = TurnState::default();
+        for (sent, message) in exchange(fixture) {
+            if !sent && message.get("method").and_then(Value::as_str) == Some("session/event") {
+                apply_event(&mut ctx, &mut state, &message["params"]);
+            }
+        }
+        assert!(state.completed);
+        assert!(state.failure.is_none());
+        assert!(state
+            .session_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("sess_")));
+        let tool = ctx
+            .assistant
+            .parts
+            .iter()
+            .find(|part| part.kind == "tool")
+            .expect("tool part");
+        assert_eq!(tool.tool.as_deref(), Some("Bash"));
+        assert_eq!(tool.state.as_ref().unwrap().status, "completed");
+        let texts: Vec<_> = ctx
+            .assistant
+            .parts
+            .iter()
+            .filter(|part| part.kind == "text")
+            .filter_map(|part| part.text.as_deref())
+            .collect();
+        assert_eq!(texts.len(), 2);
+        assert!(texts[1].starts_with("Done."));
+    }
+
+    #[test]
+    fn a_tool_approval_answers_with_zcodes_own_options() {
+        let (params, recorded) = request_and_answer(
+            include_str!("fixtures/zcode_app_server_permission.jsonl"),
+            "interaction/requestPermission",
+        );
+        let ask = Ask::of("interaction/requestPermission", &params).unwrap();
+        let (tool, input) = ask.card();
+        assert_eq!(tool, "Bash");
+        assert!(input["command"]
+            .as_str()
+            .unwrap()
+            .starts_with("rm -rf build"));
+        let allow = ask.reply(&PermissionDecision::Allow {
+            updated_input: Some(input),
+        });
+        assert_eq!(allow, recorded);
+        assert_eq!(allow["decision"], "allow");
+        let deny = ask.reply(&PermissionDecision::Deny {
+            message: "The user denied this action.".into(),
+        });
+        assert_eq!(
+            deny,
+            json!({"decision": "deny", "reason": "The user denied this action."})
+        );
+    }
+
+    #[test]
+    fn a_plan_approval_becomes_a_plan_card() {
+        let (params, recorded) = request_and_answer(
+            include_str!("fixtures/zcode_app_server_plan.jsonl"),
+            "interaction/requestUserInput",
+        );
+        let ask = Ask::of("interaction/requestUserInput", &params).unwrap();
+        assert_eq!(
+            ask,
+            Ask::Plan {
+                plan: "1. Create hello.txt\n2. Run git status".into()
+            }
+        );
+        assert_eq!(ask.card().0, "ExitPlanMode");
+        let approve = ask.reply(&PermissionDecision::Allow {
+            updated_input: None,
+        });
+        assert_eq!(approve, recorded);
+        // A note is feedback on the plan; a plain rejection declines it.
+        assert_eq!(
+            ask.reply(&PermissionDecision::Allow {
+                updated_input: Some(json!({"feedback": "Use Rust"})),
+            }),
+            json!({"action": "accept", "content": {"answer": "Use Rust"}})
+        );
+        assert_eq!(
+            ask.reply(&PermissionDecision::Deny {
+                message: "the turn was interrupted".into(),
+            }),
+            json!({"action": "decline"})
+        );
+    }
+
+    #[test]
+    fn a_question_is_answered_by_its_text() {
+        let (params, recorded) = request_and_answer(
+            include_str!("fixtures/zcode_app_server_question.jsonl"),
+            "interaction/requestUserInput",
+        );
+        let ask = Ask::of("interaction/requestUserInput", &params).unwrap();
+        let (tool, input) = ask.card();
+        assert_eq!(tool, "AskUserQuestion");
+        let card = crate::local::harness::question_prompt(tool, Some(&input)).unwrap();
+        assert_eq!(card.question.as_deref(), Some("Which language?"));
+        assert_eq!(card.options.len(), 2);
+        let answer = ask.reply(&PermissionDecision::Allow {
+            updated_input: Some(json!({"answers": {"Which language?": "Rust"}})),
+        });
+        assert_eq!(answer, recorded);
+        // The tool reports the answer back to the model.
+        let result = exchange(include_str!("fixtures/zcode_app_server_question.jsonl"))
+            .into_iter()
+            .find_map(|(_, m)| {
+                (m.pointer("/params/payload/kind").and_then(Value::as_str) == Some("result"))
+                    .then(|| m["params"]["payload"]["result"]["content"].clone())
+            })
+            .unwrap();
+        assert!(result
+            .as_str()
+            .unwrap()
+            .contains("\"Which language?\"=\"Rust\""));
+        // Other interactions are not shown.
+        assert_eq!(
+            Ask::of(
+                "interaction/requestUserInput",
+                &json!({"toolName": "Other"})
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_session_switches_to_the_composers_model() {
+        let fixture = include_str!("fixtures/zcode_app_server_permission.jsonl");
+        let snapshot = exchange(fixture)
+            .into_iter()
+            .find_map(|(sent, m)| (!sent && m.pointer("/result/settings").is_some()).then_some(m))
+            .unwrap();
+        let settings = &snapshot["result"]["settings"];
+        // Already on the model at its default level: nothing to switch.
+        assert_eq!(model_selection(settings, "custom/mock-model", None), None);
+        assert_eq!(
+            model_selection(settings, "custom/mock-model", Some("disabled")),
+            Some(json!({
+                "providerId": "custom",
+                "modelId": "mock-model",
+                "options": {"reasoningLevel": "disabled"}
+            }))
+        );
+        // A level the model lacks keeps its default.
+        assert_eq!(
+            model_selection(settings, "custom/mock-model", Some("max")),
+            None
+        );
+        // A model the session does not list is still asked for, so ZCode
+        // says why it cannot use it.
+        assert_eq!(
+            model_selection(settings, "account:zai-individual-coding-plan/GLM-5.3", None),
+            Some(json!({"providerId": "account:zai-individual-coding-plan", "modelId": "GLM-5.3"}))
+        );
+        assert_eq!(model_selection(settings, "no-provider", None), None);
+    }
+
+    #[test]
+    fn questions_always_reach_the_user() {
+        let preferences = runtime_preferences();
+        assert_eq!(preferences["askUserQuestionAutoResolutionEnabled"], false);
+        assert_eq!(preferences["memoryEnabled"], false);
     }
 
     #[test]
@@ -1315,54 +1988,7 @@ mod tests {
             ]
         );
 
-        select_model(&dir, "account:zai-individual-coding-plan/GLM-5.3-Flash").unwrap();
-        let config = super::super::detect::read_json(v2.join("provider_config.json")).unwrap();
-        assert_eq!(
-            config.pointer("/config/defaultModelSelection"),
-            Some(&serde_json::json!({
-                "providerId": "account:zai-individual-coding-plan",
-                "modelId": "GLM-5.3-Flash"
-            }))
-        );
-        // The rest of the file is kept.
-        assert_eq!(
-            config.pointer("/config/providerConfigRules/providerRules/0/providerId"),
-            Some(&serde_json::json!("zai-api"))
-        );
-        assert!(select_model(&dir, "no-provider").is_err());
-        // The write goes through a per-call temp file that does not stay behind.
-        let names: Vec<_> = std::fs::read_dir(&v2)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with("provider_config"))
-            .collect();
-        assert_eq!(names, vec!["provider_config.json"]);
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn the_model_settles_when_the_runtime_reports_it_or_the_turn_ends() {
-        let first_settled = |fixture: &str| {
-            fixture
-                .lines()
-                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                .find(model_settled)
-                .and_then(|event| {
-                    event
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-        };
-        // Title and turn start come before the runtime has read its model.
-        assert_eq!(
-            first_settled(include_str!("fixtures/zcode_stream_tool.jsonl")).as_deref(),
-            Some("session.updated")
-        );
-        assert_eq!(
-            first_settled(include_str!("fixtures/zcode_stream_no_model.jsonl")).as_deref(),
-            Some("turn.failed")
-        );
     }
 
     #[test]
