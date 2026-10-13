@@ -1,3 +1,11 @@
+> **This is a fork** of [alphaXiv/OpenResearch](https://github.com/alphaXiv/OpenResearch)
+> that adds [Kimi Code, MiniMax Code and ZCode](docs/new-harnesses.md) as agents.
+> Its releases are a Windows and Linux desktop app and `orx` CLI, published from
+> this repository, and both update from it. They are development-channel
+> builds: no telemetry or feedback reaches alphaXiv, nothing is code-signed (so
+> Windows shows a SmartScreen warning: **More info** → **Run anyway**), and there
+> is no macOS app.
+
 <div align="center">
 
 <h1><img src=".github/readme-assets/openresearch.svg" alt="" width="56" align="absmiddle" /> OpenResearch</h1>
@@ -9,6 +17,7 @@ The local-first harness & workspace for research agents.
 <p>
 <a href="https://github.com/artur-shaikhutdinov/OpenResearch-Kimi-MiniMax-ZCode/releases/latest"><img src="https://img.shields.io/github/v/release/artur-shaikhutdinov/OpenResearch-Kimi-MiniMax-ZCode?style=flat-square" alt="Latest release" /></a>
 <a href="https://github.com/artur-shaikhutdinov/OpenResearch-Kimi-MiniMax-ZCode/blob/main/LICENSE"><img src="https://img.shields.io/github/license/artur-shaikhutdinov/OpenResearch-Kimi-MiniMax-ZCode?style=flat-square" alt="License" /></a>
+<a href="https://doi.org/10.5281/zenodo.23025872"><img src="https://img.shields.io/badge/DOI-10.5281%2Fzenodo.23025872-blue?style=flat-square" alt="DOI 10.5281/zenodo.23025872" /></a>
 </p>
 
 <p><a href="README.md">English</a> · <a href="README.es.md">Español</a> · <a href="README.ko.md">한국어</a> · <a href="README.zh.md">简体中文</a> · <a href="README.ja.md">日本語</a></p>
@@ -31,20 +40,10 @@ The local-first harness & workspace for research agents.
 
 <p><sub>Windows beta requires <a href="docs/windows.md">Git for Windows</a></sub></p>
 
-<p><a href="https://doi.org/10.5281/zenodo.23025872"><img src=".github/readme-assets/doi-zenodo.svg" alt="DOI 10.5281/zenodo.23025872" width="193" height="20" /></a></p>
-
 <p><a href="https://trendshift.io/repositories/89363"><img src="https://trendshift.io/api/badge/repositories/89363" alt="GitHub Trending: #1 Repository of the Day" width="250" height="55" /></a>
 <a href="https://trendshift.io/repositories/89363?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-89363" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/89363/daily?language=Rust" alt="alphaXiv/OpenResearch | Trendshift" width="250" height="55" /></a></p>
 
 </div>
-
-> **This is a fork** of [alphaXiv/OpenResearch](https://github.com/alphaXiv/OpenResearch)
-> that adds [Kimi Code, MiniMax Code and ZCode](docs/new-harnesses.md) as agents.
-> Its releases are a Windows and Linux desktop app and `orx` CLI, published from
-> this repository, and both update from it. They are development-channel
-> builds: no telemetry or feedback reaches alphaXiv, nothing is code-signed (so
-> Windows shows a SmartScreen warning: **More info** → **Run anyway**), and there
-> is no macOS app.
 
 ## Get started
 
