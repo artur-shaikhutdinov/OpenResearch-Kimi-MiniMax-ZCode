@@ -9,6 +9,7 @@ import type {
   ChatSession,
   ContextUsage,
   Experiment,
+  HarnessId,
   OverleafLiveStatus,
   Project,
   QueuedMessage,
@@ -85,7 +86,8 @@ function emitProjectActivityEvent() {
 }
 
 export interface HarnessAuthEvent {
-  harness: string;
+  /** `*` after a reconnect: any harness may have changed while events were lost. */
+  harness: HarnessId | "*";
   authState: string;
 }
 
@@ -208,6 +210,7 @@ const REOPEN_AFTER_MS = 3_000;
 
 export interface OrxEventHandlers {
   onRun: (run: Run) => void;
+  onRunLog?: (event: RunLogEvent) => void;
   onExperiment?: (experiment: Experiment) => void;
   onProject?: (project: Project) => void;
   onReconnect?: () => void;
@@ -306,7 +309,10 @@ export function useOrxEventStream(handlers: OrxEventHandlers) {
       });
       es.addEventListener("run.log", (e) => {
         const d = parse<RunLogEvent>(e as MessageEvent);
-        if (d?.runId) emitRunLog(d);
+        if (d?.runId) {
+          emitRunLog(d);
+          emitEntity.onRunLog(d);
+        }
       });
       es.addEventListener("chat.session", (e) => {
         const d = parse<{ session: ChatSession }>(e as MessageEvent);
@@ -391,7 +397,7 @@ export function useOrxEventStream(handlers: OrxEventHandlers) {
   }, []);
 }
 
-type EntityObservers = Pick<OrxEventHandlers, "onRun" | "onReconnect">;
+type EntityObservers = Pick<OrxEventHandlers, "onRun" | "onRunLog" | "onReconnect">;
 const entityListeners = new Set<EntityObservers>();
 export function useOrxEvents(handlers: EntityObservers) {
   const ref = useRef(handlers);
@@ -399,6 +405,7 @@ export function useOrxEvents(handlers: EntityObservers) {
   useEffect(() => {
     const listener: EntityObservers = {
       onRun: (run) => ref.current.onRun(run),
+      onRunLog: (event) => ref.current.onRunLog?.(event),
       onReconnect: () => ref.current.onReconnect?.(),
     };
     entityListeners.add(listener);
@@ -407,5 +414,6 @@ export function useOrxEvents(handlers: EntityObservers) {
 }
 export const emitEntity = {
   onRun: (run: Run) => entityListeners.forEach((h) => h.onRun(run)),
+  onRunLog: (event: RunLogEvent) => entityListeners.forEach((h) => h.onRunLog?.(event)),
   onReconnect: () => entityListeners.forEach((h) => h.onReconnect?.()),
 };

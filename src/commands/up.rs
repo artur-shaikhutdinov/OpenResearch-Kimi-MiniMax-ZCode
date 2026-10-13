@@ -178,6 +178,10 @@ pub async fn run(args: UpArgs) -> Result<()> {
         state.data_dir_move_in_progress.clone(),
         state.data_dir_gate.clone(),
     ));
+    tokio::spawn(adopt_orphaned_runs(
+        state.data_dir_move_in_progress.clone(),
+        state.data_dir_gate.clone(),
+    ));
     spawn_claude_auth_monitor(
         state.chat.clone(),
         claude.clone(),
@@ -754,7 +758,9 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
         )
         .route(
             "/api/chat/sessions/{id}",
-            axum::routing::delete(delete_chat_session).patch(update_chat_session),
+            get(get_chat_session)
+                .delete(delete_chat_session)
+                .patch(update_chat_session),
         )
         .route("/api/chat/sessions/{id}/messages", get(chat_messages))
         .route("/api/chat/sessions/{id}/worktree", get(session_worktree))
@@ -1993,7 +1999,11 @@ async fn delete_project(State(state): State<AppState>, Path(id): Path<String>) -
     if !in_flight.is_empty() {
         let mut failures = Vec::new();
         for run in &in_flight {
-            if let Err(err) = crate::commands::exp::request_local_run_cancel(&store, &run.id) {
+            if let Err(err) = crate::commands::exp::request_local_run_cancel(
+                &store,
+                &run.id,
+                "Cancel requested because the project is being deleted.",
+            ) {
                 failures.push(format!("{}: {err}", run.id));
             }
         }
@@ -2103,6 +2113,8 @@ struct CreateRunReq {
     telemetry_suppressed: bool,
     experiment_id: String,
     backend: Option<String>,
+    cpus: Option<u32>,
+    mem: Option<String>,
     flavor: Option<String>,
     host: Option<String>,
     container: Option<String>,
@@ -2118,6 +2130,67 @@ struct CreateRunReq {
     force: bool,
     chat_session_id: Option<String>,
     agent_origin: Option<String>,
+    /// Absent from dashboard callers; checked against orx up's own config dir.
+    caller_config_dir: Option<std::path::PathBuf>,
+}
+
+impl CreateRunReq {
+    fn from_run_args(args: &crate::ExpRunArgs) -> Result<Self> {
+        Ok(Self {
+            telemetry_suppressed: args.telemetry_suppressed
+                || !crate::telemetry::accounting_reports_enabled(),
+            invocation_context: args
+                .invocation_identity()?
+                .map(|identity| serde_json::to_string(&identity))
+                .transpose()?,
+            experiment_id: args.exp_id.clone(),
+            backend: args.backend.clone(),
+            cpus: args.cpus,
+            mem: args.mem.clone(),
+            flavor: args.flavor.clone(),
+            host: args.host.clone(),
+            container: args.container.clone(),
+            no_container: args.no_container,
+            manifest: args.manifest.clone(),
+            image: args.image.clone(),
+            timeout: args.timeout.clone(),
+            org: args.org.clone(),
+            provider: args.provider.clone(),
+            disk: args.disk,
+            force: args.force,
+            chat_session_id: args.launching_chat_session(),
+            agent_origin: args.agent_origin.clone(),
+            caller_config_dir: Some(absolute_config_dir()),
+        })
+    }
+
+    fn into_run_args(self) -> crate::ExpRunArgs {
+        let mut backend = self.backend;
+        let mut flavor = self.flavor;
+        local::apply_compute_default(&mut backend, &mut flavor);
+        crate::ExpRunArgs {
+            invocation_context: self.invocation_context,
+            telemetry_suppressed: self.telemetry_suppressed,
+            exp_id: self.experiment_id,
+            disk: self.disk,
+            provider: self.provider,
+            backend: Some(backend.unwrap_or_else(|| "local".to_string())),
+            flavor,
+            org: self.org,
+            host: self.host,
+            container: self.container,
+            no_container: self.no_container,
+            manifest: self.manifest,
+            image: self.image,
+            timeout: self.timeout,
+            cpus: self.cpus,
+            mem: self.mem,
+            force: self.force,
+            chat_session_id: self.chat_session_id,
+            agent_origin: self.agent_origin,
+            forwarded: true,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -2129,6 +2202,7 @@ pub(crate) struct RunLaunchSummary {
     pub run_id: String,
     pub experiment_id: String,
     pub job_id: Option<String>,
+    pub slurm_resources: Option<String>,
 }
 
 async fn decode_local_response<T: serde::de::DeserializeOwned>(
@@ -2184,29 +2258,7 @@ pub(crate) async fn submit_run_via_up(
     port: u16,
     args: &crate::ExpRunArgs,
 ) -> Result<RunLaunchSummary> {
-    let request = CreateRunReq {
-        telemetry_suppressed: args.telemetry_suppressed
-            || !crate::telemetry::accounting_reports_enabled(),
-        invocation_context: args
-            .invocation_identity()?
-            .map(|identity| serde_json::to_string(&identity))
-            .transpose()?,
-        experiment_id: args.exp_id.clone(),
-        backend: args.backend.clone(),
-        flavor: args.flavor.clone(),
-        host: args.host.clone(),
-        container: args.container.clone(),
-        no_container: args.no_container,
-        manifest: args.manifest.clone(),
-        image: args.image.clone(),
-        timeout: args.timeout.clone(),
-        org: args.org.clone(),
-        provider: args.provider.clone(),
-        disk: args.disk,
-        force: args.force,
-        chat_session_id: args.launching_chat_session(),
-        agent_origin: args.agent_origin.clone(),
-    };
+    let request = CreateRunReq::from_run_args(args)?;
     let response =
         authenticate_up_request(local_client()?.post(format!("http://127.0.0.1:{port}/api/runs")))
             .json(&request)
@@ -2221,34 +2273,42 @@ pub(crate) async fn submit_run_via_up(
         .and_then(|backend| backend.get("jobId"))
         .and_then(Value::as_str)
         .map(str::to_string);
+    let slurm_resources = response
+        .run
+        .backend
+        .and_then(|backend| serde_json::from_value(backend).ok())
+        .and_then(|backend| local::slurm::requested_resources(&backend));
     Ok(RunLaunchSummary {
         run_id: response.run.id,
         experiment_id: args.exp_id.clone(),
         job_id,
+        slurm_resources,
     })
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct HarnessInstall {
-    pub name: String,
-    pub installed: bool,
-}
-
-/// `orx up`'s install evidence for `harness`, from its own PATH rather than the caller's.
-pub(crate) async fn harness_install_via_up(port: u16, harness: &str) -> Result<HarnessInstall> {
-    let response = authenticate_up_request(local_client()?.get(format!(
-        "http://127.0.0.1:{port}/api/harnesses/{harness}/snapshot"
-    )))
-    .timeout(Duration::from_secs(10))
+pub(crate) async fn chat_request_via_up(
+    port: u16,
+    method: reqwest::Method,
+    path: &str,
+    body: &Value,
+) -> Result<Value> {
+    let response = authenticate_up_request(
+        local_client()?.request(method, format!("http://127.0.0.1:{port}{path}")),
+    )
+    .json(body)
     .send()
     .await
-    .map_err(|error| anyhow!("Could not reach the trusted orx up process: {error}"))?;
-    decode_local_response(response, "check the harness").await
+    .map_err(|error| anyhow!("Could not reach the trusted OpenResearch server: {error}"))?;
+    decode_local_response(response, "submit the chat request").await
 }
 
 pub(crate) async fn cancel_run_via_up(port: u16, run_id: &str) -> Result<()> {
     let response = authenticate_up_request(
-        local_client()?.post(format!("http://127.0.0.1:{port}/api/runs/{run_id}/cancel")),
+        local_client()?
+            .post(format!("http://127.0.0.1:{port}/api/runs/{run_id}/cancel"))
+            .json(&CancelRunReq {
+                chat_session_id: local::chat::launching_chat_session(),
+            }),
     )
     .send()
     .await
@@ -2257,9 +2317,45 @@ pub(crate) async fn cancel_run_via_up(port: u16, run_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Launching with orx up's settings after the caller checked its own would
+/// submit to a different cluster or namespace than the one the caller tested.
+/// A relative `XDG_CONFIG_HOME` names a different dir in each process's working directory.
+fn absolute_config_dir() -> std::path::PathBuf {
+    let dir = crate::config::config_dir();
+    std::path::absolute(&dir).unwrap_or(dir)
+}
+
+fn require_caller_config_dir(
+    caller: Option<&std::path::Path>,
+    own: &std::path::Path,
+) -> Result<()> {
+    let Some(caller) = caller else {
+        return Ok(());
+    };
+    let same = caller == own
+        || crate::paths::canonicalize(caller)
+            .ok()
+            .zip(crate::paths::canonicalize(own).ok())
+            .is_some_and(|(a, b)| a == b);
+    if same {
+        return Ok(());
+    }
+    let base = own.parent().unwrap_or(own);
+    Err(anyhow!(
+        "This command uses the compute settings in {}, but orx up launches runs with \
+         the settings in {}. Set XDG_CONFIG_HOME to {} and re-run, or restart orx up \
+         from this environment.",
+        caller.display(),
+        own.display(),
+        base.display()
+    ))
+}
+
 async fn create_run(State(state): State<AppState>, Json(req): Json<CreateRunReq>) -> ApiResult {
     reject_if_stopping(&state)?;
     reject_if_moving(&state)?;
+    require_caller_config_dir(req.caller_config_dir.as_deref(), &absolute_config_dir())
+        .map_err(bad_request)?;
     let store = Store::open()?;
     let experiment = store
         .get_local_experiment(&req.experiment_id)?
@@ -2268,30 +2364,8 @@ async fn create_run(State(state): State<AppState>, Json(req): Json<CreateRunReq>
         .project_lifecycle
         .admit(&experiment.project_id)
         .ok_or_else(|| bad_request("project deletion is in progress"))?;
-    let mut backend = req.backend;
-    let mut flavor = req.flavor;
-    // Dashboard callers may omit these; forwarded CLI requests arrive resolved.
-    local::apply_compute_default(&mut backend, &mut flavor);
-    let args = crate::ExpRunArgs {
-        invocation_context: req.invocation_context,
-        telemetry_suppressed: req.telemetry_suppressed,
-        exp_id: req.experiment_id,
-        disk: req.disk,
-        provider: req.provider,
-        backend: Some(backend.unwrap_or_else(|| "local".to_string())),
-        flavor,
-        org: req.org,
-        host: req.host,
-        container: req.container,
-        no_container: req.no_container,
-        manifest: req.manifest,
-        image: req.image,
-        timeout: req.timeout,
-        force: req.force,
-        chat_session_id: req.chat_session_id,
-        agent_origin: req.agent_origin,
-        forwarded: true,
-    };
+    // Dashboard callers may omit compute options; forwarded CLI requests arrive resolved.
+    let args = req.into_run_args();
     crate::compute::validate_run_args(&args).map_err(bad_request)?;
     let run = crate::compute::submit(&args).await.map_err(bad_request)?;
     Ok(Json(json!({ "run": ApiRun::from(&run) })))
@@ -2351,7 +2425,18 @@ async fn list_instances() -> ApiResult {
     Ok(Json(json!({ "instances": instances })))
 }
 
-async fn cancel_run(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+/// Sent by `orx exp cancel`; the dashboard and older CLIs post no body.
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelRunReq {
+    chat_session_id: Option<String>,
+}
+
+async fn cancel_run(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    req: Option<Json<CancelRunReq>>,
+) -> ApiResult {
     reject_if_moving(&state)?;
     let store = Store::open()?;
     let run = local::local_run(&store, &id)?.ok_or_else(|| not_found("run"))?;
@@ -2359,8 +2444,12 @@ async fn cancel_run(State(state): State<AppState>, Path(id): Path<String>) -> Ap
     if is_terminal(&run.status) {
         return Ok(Json(json!({ "ok": true, "alreadyTerminal": true })));
     }
+    let reason = match req {
+        Some(Json(req)) => crate::commands::exp::exp_cancel_reason(req.chat_session_id.as_deref()),
+        None => "Cancel requested through orx up (dashboard or an older orx CLI).".into(),
+    };
     let backend = backend_for_run(&run)?;
-    backend.cancel(&run).await.map_err(bad_request)?;
+    backend.cancel(&run, &reason).await.map_err(bad_request)?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -2589,7 +2678,8 @@ struct StarterPromptsQuery {
 /// Four starter prompts for the empty chat, written by a model that has read
 /// the project (paper, README, code). Slow on a cache miss — one headless
 /// model call — so the UI shows a placeholder while it waits. A blank project
-/// is flagged instead so the UI shows its pre-written prompts.
+/// with no profile to tailor to, or whose tailored prompts fail, is flagged so
+/// the UI shows its pre-written prompts.
 async fn project_starter_prompts(
     Path(id): Path<String>,
     Query(q): Query<StarterPromptsQuery>,
@@ -4417,6 +4507,62 @@ impl axum::body::HttpBody for ActiveBody {
     fn size_hint(&self) -> hyper::body::SizeHint {
         self.body.size_hint()
     }
+}
+
+const ORPHANED_RUN_SCAN_INTERVAL: Duration = Duration::from_secs(60);
+/// SSH container launches record their handle before the job starts; leave them this long to finish.
+const ORPHANED_RUN_SETTLE_MS: i64 = 5 * 60 * 1000;
+
+/// Give a supervisor to every submitted local run that has none, so a launch
+/// whose supervisor spawn failed (OR-334) is tracked instead of stuck `starting`.
+async fn adopt_orphaned_runs(moving: Arc<AtomicBool>, gate: Arc<tokio::sync::Mutex<()>>) {
+    // Runs whose spawn failure is already logged, so a stuck run logs once.
+    let mut reported = HashSet::new();
+    loop {
+        tokio::time::sleep(ORPHANED_RUN_SCAN_INTERVAL).await;
+        if moving.load(Ordering::SeqCst) {
+            continue;
+        }
+        let _gate = gate.lock().await;
+        if moving.load(Ordering::SeqCst) {
+            continue;
+        }
+        match tokio::task::spawn_blocking(adopt_orphaned_runs_once).await {
+            Ok(Ok(failures)) => {
+                for (run_id, err) in failures {
+                    if reported.insert(run_id.clone()) {
+                        eprintln!("orx up: could not recover supervisor for run {run_id}: {err}");
+                    }
+                }
+            }
+            Ok(Err(err)) => {
+                eprintln!("orx up: could not check runs for missing supervisors: {err}")
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+/// Spawns the missing supervisors and returns the runs whose spawn failed.
+fn adopt_orphaned_runs_once() -> Result<Vec<(String, crate::error::Error)>> {
+    let store = Store::open()?;
+    let mut failures = Vec::new();
+    for run in store.list_active_runs()? {
+        // Without a job handle the launch may still be submitting, and a supervisor would fail it.
+        let submitted = crate::jobs::BackendDescriptor::parse(&run.backend_json)
+            .is_ok_and(|descriptor| descriptor.job_id.is_some());
+        if !submitted
+            || now_ms() - run.updated_at < ORPHANED_RUN_SETTLE_MS
+            || store.get_local_experiment(&run.experiment_id)?.is_none()
+            || crate::commands::supervise::supervisor_running(&run.id)
+        {
+            continue;
+        }
+        if let Err(err) = crate::commands::exp::spawn_detached_supervise(&run.id) {
+            failures.push((run.id, err));
+        }
+    }
+    Ok(failures)
 }
 
 /// Relaunch into an update installed underneath this server once that interrupts nothing,
@@ -6366,6 +6512,8 @@ const FILL_RETRY_FLOOR: Duration = Duration::from_secs(5);
 struct HarnessQuery {
     refresh: Option<u8>,
     retry: Option<u8>,
+    /// With `refresh=1`, re-detect only this harness instead of every one.
+    harness: Option<String>,
 }
 
 fn overlay_claude_auth(payload: &mut Value, snapshot: &local::claude::AuthSnapshot) {
@@ -6639,11 +6787,24 @@ async fn list_harnesses(
 /// a background fill replaces the entry with the full catalog, then tells the
 /// dashboard to re-read it. `refresh=1` still runs the full probe inline: an
 /// explicit re-check wants the real answer, and the UI shows its own spinner.
+/// With `harness=<id>` it probes only that harness (unless a fill is running)
+/// and serves the cache with it patched in.
 async fn harnesses_payload(state: &AppState, q: &HarnessQuery) -> Value {
     // `retry` only escalates to a full detect when it actually cleared a
     // runtime rejection — a bare retry is an ordinary cached read.
     let retried = q.retry == Some(1) && state.claude.clear_runtime_rejection();
-    if q.refresh == Some(1) || retried {
+    if let (Some(1), Some(id)) = (q.refresh, q.harness.as_deref()) {
+        // Publishing re-stamps the cache, voiding an in-flight fill's other harnesses;
+        // the fill commits this one itself and the auth monitor re-checks after it.
+        if !state
+            .harness_fill_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            if let Some(info) = local::harness::detect_harness(id).await {
+                publish_harness(state, &info).await;
+            }
+        }
+    } else if q.refresh == Some(1) || retried {
         // An explicit re-check detects outside the cache lock: a full sweep
         // takes seconds and must not stall every ordinary read queued behind
         // it. Last writer wins — concurrent refreshes may duplicate a sweep.
@@ -6687,8 +6848,8 @@ async fn harnesses_payload(state: &AppState, q: &HarnessQuery) -> Value {
     seed_harnesses_locked(state, &mut cache).await
 }
 
-/// Commit one harness's full detection after setup changed it, so the
-/// dashboard need not wait on every sibling's probes to see the result.
+/// Commit one harness's full detection after setup or a sign-in changed it, so
+/// the dashboard need not wait on every sibling's probes to see the result.
 async fn publish_harness(state: &AppState, info: &local::harness::HarnessInfo) {
     if info.id == "claude-code" {
         if let Some(probe) = info.auth_observation.as_ref() {
@@ -6779,7 +6940,7 @@ async fn seed_harnesses_locked(
 /// live Claude auth observations and first-install telemetry.
 /// The returned `Option` is a claimed auth announcement: the caller emits it
 /// only after committing the payload, so a discarded pass never sends the
-/// dashboard on a `refresh=1` sweep for results nobody will see.
+/// dashboard to re-probe Claude for results nobody will see.
 async fn finish_harnesses_payload(
     state: &AppState,
     harnesses: Vec<local::harness::HarnessInfo>,
@@ -6805,8 +6966,8 @@ async fn finish_harnesses_payload(
         snapshot = state.claude.auth_snapshot();
     }
     // A provisional pass must not announce: `harness.auth` makes the dashboard
-    // call `refreshHarnesses(true)`, an inline full sweep — the stall this
-    // whole design exists to remove — fired by the snapshot's own adoption.
+    // re-probe Claude inline — the stall this whole design exists to remove —
+    // fired by the snapshot's own adoption.
     // A real pass hands its auth snapshot back unclaimed; the caller claims at
     // emit time, after the payload commits, so a pass that loses the cache
     // race never burns a generation it can't announce.
@@ -7118,7 +7279,7 @@ async fn list_chat_sessions(
 #[serde(rename_all = "camelCase")]
 struct CreateChatSessionReq {
     project_id: String,
-    harness: String,
+    harness: Option<String>,
     model: Option<String>,
     service_tier: Option<String>,
     permission_mode: Option<String>,
@@ -7128,14 +7289,117 @@ struct CreateChatSessionReq {
     autonomy: Option<Autonomy>,
 }
 
+fn new_chat_settings(
+    project_id: String,
+    preferences: crate::store::StoredUiState,
+    catalog: &Value,
+) -> Result<CreateChatSessionReq> {
+    let harnesses = catalog
+        .get("harnesses")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("OpenResearch could not load New Chat settings."))?;
+    let saved = preferences.preferred_agent;
+    let selected = match saved.as_ref() {
+        Some(saved) => harnesses
+            .iter()
+            .find(|h| h.get("id").and_then(Value::as_str) == Some(&saved.harness)),
+        None => harnesses
+            .iter()
+            .find(|h| h.get("agentReady").and_then(Value::as_bool) == Some(true)),
+    }
+    .ok_or_else(|| {
+        anyhow!("Your New Chat agent is unavailable. Select an available agent in New Chat.")
+    })?;
+    if selected.get("agentReady").and_then(Value::as_bool) != Some(true) {
+        return Err(anyhow!("Your New Chat agent is unavailable. Check its installation and sign-in in OpenResearch."));
+    }
+    let string = |value: Option<&Value>| value.and_then(Value::as_str).map(str::to_string);
+    let harness = string(selected.get("id"));
+    let models = selected.get("models").and_then(Value::as_array);
+    let model = saved.as_ref().and_then(|s| s.model.clone()).or_else(|| {
+        if saved.is_none() {
+            string(models.and_then(|m| m.first()).and_then(|m| m.get("id")))
+        } else {
+            None
+        }
+    });
+    let metadata = models.and_then(|models| {
+        models
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_str) == model.as_deref())
+    });
+    let options = selected.get("options");
+    let choices = metadata
+        .and_then(|m| m.get("reasoningLevels"))
+        .or_else(|| options.and_then(|o| o.get("reasoningLevels")))
+        .and_then(Value::as_array);
+    let has = |choices: Option<&Vec<Value>>, id: &str| {
+        choices.is_some_and(|choices| {
+            choices
+                .iter()
+                .any(|c| c.get("id").and_then(Value::as_str) == Some(id))
+        })
+    };
+    let model_default = string(metadata.and_then(|m| m.get("defaultReasoningLevel")));
+    let default_reasoning = model_default
+        .filter(|id| has(choices, id))
+        .or_else(|| has(choices, "default").then(|| "default".to_string()))
+        .or_else(|| string(options.and_then(|o| o.get("defaultReasoningLevel"))))
+        .or_else(|| string(choices.and_then(|c| c.first()).and_then(|c| c.get("id"))));
+    let reasoning_level = if choices.is_none_or(Vec::is_empty) {
+        Some("default".to_string())
+    } else {
+        saved
+            .as_ref()
+            .and_then(|s| s.reasoning_level.clone())
+            .filter(|id| has(choices, id))
+            .or(default_reasoning)
+    };
+    let tiers = metadata
+        .and_then(|m| m.get("serviceTiers"))
+        .and_then(Value::as_array);
+    let service_tier = if harness.as_deref() == Some("codex") && tiers.is_some() {
+        Some(
+            saved
+                .as_ref()
+                .and_then(|s| s.service_tier.clone())
+                .filter(|id| id == "default" || has(tiers, id))
+                .unwrap_or_else(|| "default".to_string()),
+        )
+    } else {
+        None
+    };
+    let permission_mode = match saved.as_ref() {
+        Some(saved) => saved.permission_mode.clone(),
+        None => string(options.and_then(|o| o.get("defaultPermissionMode"))),
+    };
+    Ok(CreateChatSessionReq {
+        project_id,
+        harness,
+        model,
+        service_tier,
+        permission_mode,
+        plan_mode: false,
+        reasoning_level,
+        autonomy: Some(preferences.preferred_autonomy.unwrap_or(Autonomy::Agentic)),
+    })
+}
+
+async fn get_chat_session(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    let session = Store::open()?
+        .get_chat_session(&id)?
+        .ok_or_else(|| not_found("chat session"))?;
+    let busy = state.chat.is_busy(&id).await;
+    Ok(Json(
+        json!({ "session": local::chat::session_json(&session, busy) }),
+    ))
+}
+
 async fn create_chat_session(
     State(state): State<AppState>,
-    Json(req): Json<CreateChatSessionReq>,
+    Json(mut req): Json<CreateChatSessionReq>,
 ) -> ApiResult {
     reject_if_moving(&state)?;
-    if !local::harness::is_chat_harness(&req.harness) {
-        return Err(bad_request(format!("unknown harness: {}", req.harness)));
-    }
     let _admission = state
         .project_lifecycle
         .admit(&req.project_id)
@@ -7144,22 +7408,41 @@ async fn create_chat_session(
     store
         .get_local_project(&req.project_id)?
         .ok_or_else(|| not_found("project"))?;
+    if req.harness.is_none() {
+        let preferences = store.ui_state()?;
+        let catalog = harnesses_payload(
+            &state,
+            &HarnessQuery {
+                refresh: None,
+                retry: None,
+                harness: None,
+            },
+        )
+        .await;
+        req = new_chat_settings(req.project_id, preferences, &catalog).map_err(bad_request)?;
+    }
+    let harness = req
+        .harness
+        .ok_or_else(|| bad_request("no agent selected"))?;
+    if !local::harness::is_chat_harness(&harness) {
+        return Err(bad_request(format!("unknown harness: {harness}")));
+    }
     let nonempty = |s: Option<String>| s.filter(|v| !v.trim().is_empty());
     let permission_mode = nonempty(req.permission_mode);
     let service_tier = nonempty(req.service_tier);
     if permission_mode
         .as_deref()
-        .is_some_and(|mode| local::harness::permission_mode_for(&req.harness, mode).is_none())
+        .is_some_and(|mode| local::harness::permission_mode_for(&harness, mode).is_none())
     {
         return Err(bad_request("invalid permission mode for selected harness"));
     }
     if service_tier
         .as_deref()
-        .is_some_and(|tier| local::harness::service_tier_for(&req.harness, tier).is_none())
+        .is_some_and(|tier| local::harness::service_tier_for(&harness, tier).is_none())
     {
         return Err(bad_request("invalid speed for selected harness"));
     }
-    if req.plan_mode && !local::harness::supports_command_plan(&req.harness) {
+    if req.plan_mode && !local::harness::supports_command_plan(&harness) {
         return Err(bad_request(
             "this harness activates Plan through permissions",
         ));
@@ -7167,7 +7450,7 @@ async fn create_chat_session(
     let session = StoredChatSession {
         id: format!("chat_{}", uuid::Uuid::new_v4()),
         project_id: req.project_id,
-        harness: req.harness,
+        harness,
         native_session_id: None,
         title: None,
         title_source: None,
@@ -7183,12 +7466,12 @@ async fn create_chat_session(
         goal: None,
         autonomy: req.autonomy.map(|autonomy| autonomy.id().to_string()),
         active_leaf_id: None,
-        parent_session_id: None,
         side_parent_session_id: None,
         created_at: now_ms(),
         updated_at: now_ms(),
     };
     store.create_chat_session(&session)?;
+    state.chat.emit_session(Some(session.clone())).await;
     Ok(Json(
         json!({ "session": local::chat::session_json(&session, false) }),
     ))
@@ -8158,6 +8441,73 @@ pub(crate) async fn spa(uri: Uri) -> Response {
 mod tests {
     use super::*;
 
+    #[test]
+    fn new_chat_uses_saved_preferences_and_normalizes_model_settings() {
+        let preferences = crate::store::StoredUiState {
+            onboarding_completed: true,
+            tour_completed: true,
+            workspace: None,
+            preferred_autonomy: Some(Autonomy::Copilot),
+            preferred_agent: Some(StoredAgentSelection {
+                harness: "codex".into(),
+                model: Some("custom-model".into()),
+                reasoning_level: Some("ultra".into()),
+                permission_mode: Some("full-access".into()),
+                service_tier: Some("priority".into()),
+            }),
+        };
+        let catalog = json!({"harnesses": [{
+            "id": "codex", "agentReady": true,
+            "models": [], "options": {"reasoningLevels": [{"id": "default"}, {"id": "high"}]}
+        }]});
+        let req = new_chat_settings("project".into(), preferences, &catalog).unwrap();
+        assert_eq!(req.harness.as_deref(), Some("codex"));
+        assert_eq!(req.model.as_deref(), Some("custom-model"));
+        assert_eq!(req.reasoning_level.as_deref(), Some("default"));
+        assert!(req.service_tier.is_none());
+        assert_eq!(req.permission_mode.as_deref(), Some("full-access"));
+        assert_eq!(req.autonomy, Some(Autonomy::Copilot));
+        assert!(!req.plan_mode);
+    }
+
+    #[test]
+    fn new_chat_falls_back_only_when_no_preference_exists() {
+        let mut preferences = crate::store::StoredUiState {
+            onboarding_completed: false,
+            tour_completed: false,
+            workspace: None,
+            preferred_autonomy: None,
+            preferred_agent: None,
+        };
+        let catalog = json!({"harnesses": [{"id":"claude-code", "agentReady":true,
+            "models":[{"id":"opus"}], "options":{"defaultPermissionMode":"plan", "reasoningLevels":[{"id":"default"}]}}]});
+        let req = new_chat_settings("project".into(), preferences.clone(), &catalog).unwrap();
+        assert_eq!(req.harness.as_deref(), Some("claude-code"));
+        assert_eq!(req.model.as_deref(), Some("opus"));
+        assert_eq!(req.permission_mode.as_deref(), Some("plan"));
+        assert_eq!(req.autonomy, Some(Autonomy::Agentic));
+        preferences.preferred_agent = Some(StoredAgentSelection {
+            harness: "claude-code".into(),
+            model: Some("custom-claude-model".into()),
+            service_tier: None,
+            permission_mode: Some("plan".into()),
+            reasoning_level: Some("default".into()),
+        });
+        let req = new_chat_settings("project".into(), preferences.clone(), &catalog).unwrap();
+        assert_eq!(req.harness.as_deref(), Some("claude-code"));
+        assert_eq!(req.model.as_deref(), Some("custom-claude-model"));
+        let unavailable = json!({"harnesses": [{"id":"claude-code", "agentReady":false}, {"id":"codex", "agentReady":true}]});
+        assert!(new_chat_settings("project".into(), preferences.clone(), &unavailable).is_err());
+        preferences.preferred_agent = Some(StoredAgentSelection {
+            harness: "codex".into(),
+            model: Some("gpt-6-sol".into()),
+            service_tier: None,
+            permission_mode: None,
+            reasoning_level: None,
+        });
+        assert!(new_chat_settings("project".into(), preferences, &catalog).is_err());
+    }
+
     #[tokio::test]
     async fn empty_local_error_reports_the_http_status() {
         for (status, body, expected) in [
@@ -8678,6 +9028,7 @@ mod tests {
             commit_sha: None,
             result_markdown: None,
             cancel_requested: true,
+            cancel_reason: None,
             chat_session_id: None,
         };
 
@@ -8700,35 +9051,66 @@ mod tests {
     }
 
     #[test]
-    fn create_run_request_round_trips_agent_attribution_and_force() {
-        let request = CreateRunReq {
+    fn create_run_request_preserves_forwarded_slurm_resources_and_attribution() {
+        let args = crate::ExpRunArgs {
             invocation_context: None,
             telemetry_suppressed: true,
-            experiment_id: "experiment-1".into(),
-            backend: Some("local".into()),
+            forwarded: false,
+            exp_id: "experiment-1".into(),
+            disk: None,
+            provider: None,
+            backend: Some("slurm".into()),
             flavor: None,
+            org: None,
             host: None,
             container: None,
             no_container: false,
             manifest: None,
             image: None,
             timeout: None,
-            org: None,
-            provider: None,
-            disk: None,
+            cpus: Some(8),
+            mem: Some("64G".into()),
             force: true,
             chat_session_id: Some("session-1".into()),
             agent_origin: None,
         };
+        let request = CreateRunReq::from_run_args(&args).unwrap();
 
         let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["callerConfigDir"], json!(absolute_config_dir()));
         assert_eq!(value["experimentId"], "experiment-1");
+        assert_eq!(value["cpus"], 8);
+        assert_eq!(value["mem"], "64G");
         assert_eq!(value["chatSessionId"], "session-1");
         assert_eq!(value["force"], true);
-        assert_eq!(
-            serde_json::from_value::<CreateRunReq>(value).unwrap(),
-            request
-        );
+        let forwarded = serde_json::from_value::<CreateRunReq>(value)
+            .unwrap()
+            .into_run_args();
+        assert_eq!(forwarded.cpus, Some(8));
+        assert_eq!(forwarded.mem.as_deref(), Some("64G"));
+        assert_eq!(forwarded.chat_session_id.as_deref(), Some("session-1"));
+        assert!(forwarded.force);
+    }
+
+    #[test]
+    fn require_caller_config_dir_rejects_a_different_dir() {
+        let root = std::env::temp_dir().join(format!("orx-caller-config-{}", uuid::Uuid::new_v4()));
+        let own = root.join("up/openresearch");
+        let caller = root.join("agent/openresearch");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(&caller).unwrap();
+
+        assert!(require_caller_config_dir(None, &own).is_ok());
+        assert!(require_caller_config_dir(Some(&own), &own).is_ok());
+        let fresh = root.join("fresh/openresearch");
+        assert!(require_caller_config_dir(Some(&fresh), &fresh).is_ok());
+        assert!(require_caller_config_dir(Some(&own.join("../openresearch")), &own).is_ok());
+        let error = require_caller_config_dir(Some(&caller), &own)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&caller.display().to_string()));
+        assert!(error.contains(&own.display().to_string()));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

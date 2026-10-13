@@ -95,6 +95,23 @@ fn windows_install_script(install: &str) -> String {
     )
 }
 
+/// `zcode login --no-browser` on Windows, through PowerShell. The desktop
+/// runtime runs through `ZCode.exe`, a GUI program: started in the terminal
+/// directly it gets no console and its output is lost, while a pipe gives it a
+/// real stdout and makes PowerShell wait for it. The script opens the sign-in
+/// URL itself: the terminal wraps the long URL into rows, so the output orx
+/// reads back holds only its first row.
+#[cfg(any(windows, test))]
+fn windows_zcode_login_script(program: &str, args: &[String]) -> String {
+    let quote = |arg: &str| format!("'{}'", arg.replace('\'', "''"));
+    let command = std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .map(quote)
+        .collect::<Vec<_>>()
+        .join(" ");
+    include_str!("zcode_login.ps1").replace("<COMMAND>", &command)
+}
+
 /// PowerShell's `-EncodedCommand` form: base64 of the script's UTF-16LE.
 #[cfg(any(windows, test))]
 fn encoded_command(script: &str) -> String {
@@ -318,6 +335,7 @@ async fn run(
             Query(super::HarnessQuery {
                 refresh: Some(1),
                 retry: None,
+                harness: None,
             }),
         )
         .await;
@@ -364,15 +382,23 @@ async fn run(
                 };
                 let (_, args) = login_command("zcode").unwrap();
                 zcode_env = launch.env.clone();
-                (
-                    launch.program.to_string_lossy().into_owned(),
-                    launch
-                        .prefix
-                        .iter()
-                        .map(|arg| arg.to_string_lossy().into_owned())
-                        .chain(args)
-                        .collect(),
-                )
+                let program = launch.program.to_string_lossy().into_owned();
+                let args: Vec<String> = launch
+                    .prefix
+                    .iter()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .chain(args)
+                    .collect();
+                #[cfg(windows)]
+                let (program, args) = (
+                    windows_powershell(),
+                    vec![
+                        "-NoProfile".into(),
+                        "-EncodedCommand".into(),
+                        encoded_command(&windows_zcode_login_script(&program, &args)),
+                    ],
+                );
+                (program, args)
             }
             Action::Login | Action::Update => {
                 let Some(harness) = crate::local::harness::detect_harness(&request.harness).await
@@ -488,7 +514,9 @@ async fn run(
         let completed: Option<&mut (dyn FnMut(&str) -> bool + Send)> =
             match request.harness.as_str() {
                 "antigravity" if login => Some(&mut antigravity),
-                "zcode" if login => Some(&mut zcode),
+                // On Windows the login script opens the URL (see
+                // `windows_zcode_login_script`).
+                "zcode" if login && !cfg!(windows) => Some(&mut zcode),
                 _ => None,
             };
         match super::relay_pty(socket, session, Some(&mut output), size, completed).await {
@@ -891,6 +919,28 @@ mod tests {
                 b"e\0x\0i\0t\0 \x001\0"
             )
         );
+    }
+
+    #[test]
+    fn the_windows_zcode_login_pipes_the_runtime_and_opens_its_url() {
+        let script = windows_zcode_login_script(
+            r"C:\Users\O'Brien\AppData\Local\Programs\ZCode\ZCode.exe",
+            &[
+                r"C:\Users\O'Brien\AppData\Local\Programs\ZCode\resources\glm\zcode.cjs".into(),
+                "login".into(),
+                "--no-browser".into(),
+            ],
+        );
+        assert!(script.contains(
+            "& 'C:\\Users\\O''Brien\\AppData\\Local\\Programs\\ZCode\\ZCode.exe' \
+             'C:\\Users\\O''Brien\\AppData\\Local\\Programs\\ZCode\\resources\\glm\\zcode.cjs' \
+             'login' '--no-browser' 2>&1 | ForEach-Object {"
+        ));
+        assert!(!script.contains("<COMMAND>"));
+        // Only the URL after the prompt, and only once.
+        assert!(script.contains("Open this URL"));
+        assert!(script.contains("Start-Process"));
+        assert!(script.contains("exit $LASTEXITCODE"));
     }
 
     #[test]
