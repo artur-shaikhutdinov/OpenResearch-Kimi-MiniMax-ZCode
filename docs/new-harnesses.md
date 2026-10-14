@@ -42,11 +42,14 @@
     covers the Z.ai Individual Coding Plan.
     The app's runtime runs its app-server as the app's helper: the app
     supplies the account. orx starts it through a small loader
-    (`src/local/harness/zcode_app_server.cjs`) that, in memory, starts the
+    (`src/local/harness/zcode_app_server.cjs`) that, in memory, makes the two
+    edits of the npm repack's `app-server-standalone-auth`: it starts the
     provider registry the way `zcode -p` does, reading `zcode login`'s
-    sign-in. A ZCode build where the loader finds nothing to change prints
-    `orx: ZCode standalone sign-in unavailable`; API-key providers still work
-    there, and a Coding Plan turn says so.
+    sign-in, and gives that registry's request credentials to each session
+    (without the second edit, each model request still asks the host). The
+    loader logs `orx: ZCode app-server sign-in: patched|native|unavailable`.
+    On a build where it finds nothing to change, API-key providers still
+    work, and a Coding Plan turn says so.
   - API key: set `ZAI_API_KEY` (Z.ai API, billed from the balance) or
     `BIGMODEL_API_KEY` (BigModel API) in Settings → Environment, as for the
     other harnesses. The runtime reads no key from the environment, so for

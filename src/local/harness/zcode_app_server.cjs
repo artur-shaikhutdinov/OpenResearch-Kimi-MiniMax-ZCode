@@ -30,24 +30,65 @@ function escape(name) {
   return name.replace(/\$/g, "\\$");
 }
 
-/** `source` with the app-server's provider registry started standalone. */
+/** `source` with the app-server signed in by itself: its provider registry
+ * started standalone, and that registry's request credentials (rather than
+ * the host's) given to each session — the two edits of the npm repack's
+ * `app-server-standalone-auth`. Both apply, or neither. */
 function standalone(source) {
   // Builds that already choose the sign-in themselves (the npm repack's
   // `ZCODE_APP_SERVER_AUTH_MODE`, standalone by default).
   if (source.includes("appServerRegistryOptions")) return { source, status: "native" };
+  const unavailable = { source, status: "unavailable" };
   const start = registeredName(source, "startProcessProviderRegistryRuntime");
   const reporter = registeredName(source, "createCliProviderRefreshReporter");
   const ready = source.indexOf(READY_LOG);
-  if (!start || !reporter || ready < 0) return { source, status: "unavailable" };
+  if (!start || !reporter || ready < 0) return unavailable;
+
+  // 1. `<registry>=await <lease>({…,create:r(()=><start>(<env>),"create")` just
+  //    before the registry reports ready.
   const call = source.lastIndexOf(`create:r(()=>${start}(`, ready);
-  if (call < 0 || ready - call > 4000) return { source, status: "unavailable" };
-  const match = source
+  if (call < 0 || ready - call > 4000) return unavailable;
+  const created = source
     .slice(call)
     .match(new RegExp(`^create:r\\(\\(\\)=>${escape(start)}\\(([\\w$]+)(?:,\\{\\})?\\),"create"\\)`));
-  if (!match) return { source, status: "unavailable" };
-  const patched = `create:r(()=>${start}(${match[1]},{standalone:${reporter}(process.stderr)}),"create")`;
+  if (!created) return unavailable;
+  const owner = source
+    .slice(Math.max(0, call - 400), call)
+    .match(/([\w$]+)=await [\w$]+\(\{[^{}]*$/);
+  if (!owner) return unavailable;
+  const registry = owner[1];
+
+  // 2. The session factory's `...<f>(<g>(…),<alias>.runtime.registryService,
+  //    <alias>.configuredDefaultModelSelection)`, where `<alias>` is that registry.
+  const factories = [
+    ...source.matchAll(
+      /\.\.\.[\w$]+\([\w$]+\([\w$]+,[\w$]+\),([\w$]+)\.runtime\.registryService,\1\.configuredDefaultModelSelection\)/g,
+    ),
+  ];
+  if (factories.length !== 1) return unavailable;
+  const [factory] = factories;
+  const alias = factory[1];
+  if (alias !== registry && !new RegExp(`[\\s,;(]${escape(alias)}=${escape(registry)}[,;]`).test(source)) {
+    return unavailable;
+  }
+  const spreadEnd = factory.index + factory[0].length;
+  const factoryEnd = source.indexOf(`"createZCodeApp")`, spreadEnd);
+  // A later property could override the credentials given here.
+  if (factoryEnd < 0 || source.slice(spreadEnd, factoryEnd).includes("providerRuntimeHeadersPort")) {
+    return unavailable;
+  }
+  if (factory.index < call) return unavailable;
+
+  const options = `${created[1]},{standalone:${reporter}(process.stderr)}`;
+  const headers = `,...${alias}.providerRuntimeHeadersPort?{providerRuntimeHeadersPort:${alias}.providerRuntimeHeadersPort}:{}`;
+  const callEnd = call + created[0].length;
   return {
-    source: source.slice(0, call) + patched + source.slice(call + match[0].length),
+    source:
+      source.slice(0, call) +
+      `create:r(()=>${start}(${options}),"create")` +
+      source.slice(callEnd, spreadEnd) +
+      headers +
+      source.slice(spreadEnd),
     status: "patched",
   };
 }
@@ -60,24 +101,20 @@ if (require.main === module) {
     process.stderr.write("orx: ORX_ZCODE_RUNTIME is not set\n");
     process.exit(2);
   }
+  // Run the runtime as the main module, compiled from the patched source
+  // here rather than through a loader hook, so nothing depends on how this
+  // Node or Electron spells the file's path.
   const target = path.resolve(runtime);
-  // Node loads the main module by its real path.
-  const real = (file) => {
-    try {
-      return fs.realpathSync(file);
-    } catch {
-      return path.resolve(file);
-    }
-  };
-  const runtimeFile = real(target);
-  const compile = Module.prototype._compile;
-  Module.prototype._compile = function (content, filename) {
-    if (real(filename) !== runtimeFile) return compile.call(this, content, filename);
-    Module.prototype._compile = compile;
-    const result = standalone(content);
-    if (result.status === "unavailable") process.stderr.write(`${UNAVAILABLE}\n`);
-    return compile.call(this, result.source, filename);
-  };
+  const result = standalone(fs.readFileSync(target, "utf8"));
+  process.stderr.write(`orx: ZCode app-server sign-in: ${result.status}\n`);
+  if (result.status === "unavailable") process.stderr.write(`${UNAVAILABLE}\n`);
+  const main = new Module(target, null);
+  main.id = ".";
+  main.filename = target;
+  main.paths = Module._nodeModulePaths(path.dirname(target));
+  Module._cache[target] = main;
+  process.mainModule = main;
   process.argv[1] = target;
-  Module.runMain();
+  main._compile(result.source, target);
+  main.loaded = true;
 }

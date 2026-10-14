@@ -1021,7 +1021,7 @@ impl Turn<'_> {
                         id,
                         json!({
                             "headersApplied": false,
-                            "errorMessage": "OpenResearch does not provide ZCode account credentials",
+                            "errorMessage": HOST_CREDENTIALS,
                         }),
                     )
                     .await?;
@@ -1214,6 +1214,28 @@ const APP_SERVER_LOADER: &str = include_str!("zcode_app_server.cjs");
 /// What the loader prints when this ZCode build cannot be signed in that way.
 const STANDALONE_UNAVAILABLE: &str = "orx: ZCode standalone sign-in unavailable";
 
+/// orx's answer when ZCode asks its host for account credentials, which the
+/// turn then fails with: the runtime is not signed in by itself.
+const HOST_CREDENTIALS: &str = "ZCode asked OpenResearch for its Coding Plan credentials";
+
+/// Why a Coding Plan model cannot run with this ZCode build, when that is the
+/// cause (from the turn's message and the loader's word in the log).
+fn sign_in_failure(message: &str, log: &str) -> Option<String> {
+    let unavailable = log.contains(STANDALONE_UNAVAILABLE);
+    if !unavailable && !message.contains(HOST_CREDENTIALS) {
+        return None;
+    }
+    let status = log
+        .lines()
+        .find_map(|line| line.strip_prefix("orx: ZCode app-server sign-in: "))
+        .unwrap_or("not reported");
+    Some(format!(
+        "OpenResearch could not use ZCode's Coding Plan sign-in with this ZCode version \
+         (sign-in loader: {status}). Choose a model of a provider with an API key, or update \
+         OpenResearch."
+    ))
+}
+
 /// The app-server launch: the desktop runtime goes through the loader; a
 /// standalone CLI (the npm build signs in by itself) runs as it is.
 fn app_server_launch(launch: Launch) -> Result<Launch> {
@@ -1309,15 +1331,9 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
             Ok(())
         }
         Err(error) => {
-            let unavailable = std::fs::read_to_string(&log_path)
-                .is_ok_and(|log| log.contains(STANDALONE_UNAVAILABLE));
-            if unavailable {
-                return Err(anyhow!(
-                    "{error}\n\nOpenResearch cannot use ZCode's Coding Plan sign-in with this ZCode \
-                     version. Choose a model of a provider with an API key, or update OpenResearch. \
-                     (log: {})",
-                    log_path.display()
-                ));
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            if let Some(why) = sign_in_failure(&error.to_string(), &log) {
+                return Err(anyhow!("{error}\n\n{why} (log: {})", log_path.display()));
             }
             Err(anyhow!("{error} (log: {})", log_path.display()))
         }
@@ -1524,6 +1540,10 @@ const COMMAND_LINE_ACCESS: &str = "Outside its app ZCode reaches models through 
      ZCode app.";
 
 fn explain_failure(message: String, log_path: &Path) -> String {
+    let log = std::fs::read_to_string(log_path).unwrap_or_default();
+    if let Some(why) = sign_in_failure(&message, &log) {
+        return format!("{message}\n\n{why} Log: {}", log_path.display());
+    }
     if message.contains(NO_MODEL) {
         return format!(
             "ZCode found no model it can use from the command line ({NO_MODEL}). \
@@ -2011,9 +2031,10 @@ mod tests {
         assert_eq!(model_selection(settings, "no-provider", None), None);
     }
 
-    /// The loader's patch on the shapes of bundle it meets: the app's
-    /// app-server call (patched to the CLI's standalone sign-in), the npm
-    /// build that already chooses its sign-in, and a build it does not know.
+    /// The loader makes both of the npm repack's edits on the app's runtime
+    /// (standalone registry, and its credentials for each session), leaves a
+    /// build that already chooses its sign-in alone, and refuses a build it
+    /// does not know. It then runs the patched runtime as the main module.
     #[test]
     fn the_loader_signs_the_app_server_in_like_the_cli() {
         let Some(node) = crate::local::shell_env::find_on_path("node") else {
@@ -2027,16 +2048,52 @@ mod tests {
         let script = r#"
 const { standalone } = require(process.argv[1]);
 const names = 'r(x$C,"startProcessProviderRegistryRuntime");r(gDe,"createCliProviderRefreshReporter");';
-const call = 'U=await FUe({create:r(()=>x$C(z),"create"),disposeLate:r(e=>e.dispose(),"disposeLate")}),u.info("Worker Provider Registry \\u5DF2\\u5C31\\u7EEA")';
-const app = standalone(names + call);
-const npm = standalone(names + 'create:r(()=>x$C(z,require("cli-config.cjs").appServerRegistryOptions(z,gDe)),"create"),u.info("Worker Provider Registry \\u5DF2\\u5C31\\u7EEA")');
-const unknown = standalone(names + 'create:r(()=>other(z),"create"),u.info("Worker Provider Registry \\u5DF2\\u5C31\\u7EEA")');
-console.log(JSON.stringify({ app, npm: npm.status, unknown: unknown.status }));
+const ready = 'u.info("Worker Provider Registry \\u5DF2\\u5C31\\u7EEA");';
+const call = 'let z=e.env??process.env;U=await FUe({signal:s,create:r(()=>x$C(z),"create"),disposeLate:r(e=>e.dispose(),"disposeLate")}),' + ready;
+const factory = 'let Fe=U,bt=1;new JEt({createZCodeApp:r((ut={})=>INn({...q0c($0c(ut,n),Fe.runtime.registryService,Fe.configuredDefaultModelSelection),env:{}}),"createZCodeApp")});';
+const app = standalone(names + call + factory);
+const npm = standalone(names + 'create:r(()=>x$C(z,require("cli-config.cjs").appServerRegistryOptions(z,gDe)),"create"),' + ready + factory);
+const noFactory = standalone(names + call);
+const overridden = standalone(names + call + factory.replace('env:{}', 'providerRuntimeHeadersPort:h'));
+const unknown = standalone(names + 'create:r(()=>other(z),"create"),' + ready + factory);
+console.log(JSON.stringify({ app, npm: npm.status, noFactory: noFactory.status, overridden: overridden.status, unknown: unknown.status }));
 "#;
-        let output = std::process::Command::new(node)
+        let output = std::process::Command::new(&node)
             .arg("-e")
             .arg(script)
             .arg(&loader)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["app"]["status"], "patched");
+        let patched = result["app"]["source"].as_str().unwrap();
+        assert!(
+            patched.contains(r#"create:r(()=>x$C(z,{standalone:gDe(process.stderr)}),"create")"#)
+        );
+        assert!(patched.contains(
+            "Fe.configuredDefaultModelSelection),...Fe.providerRuntimeHeadersPort?{providerRuntimeHeadersPort:Fe.providerRuntimeHeadersPort}:{},env:{}"
+        ));
+        assert_eq!(result["npm"], "native");
+        assert_eq!(result["noFactory"], "unavailable");
+        assert_eq!(result["overridden"], "unavailable");
+        assert_eq!(result["unknown"], "unavailable");
+
+        // Run as the loader: the runtime is the main module, with its own argv.
+        let runtime = dir.join("zcode.cjs");
+        std::fs::write(
+            &runtime,
+            "#!/usr/bin/env node\nconsole.log(JSON.stringify({main: require.main === module, file: __filename, args: process.argv.slice(2)}));\n",
+        )
+        .unwrap();
+        let output = std::process::Command::new(&node)
+            .arg(&loader)
+            .args(["app-server", "--stdio"])
+            .env("ORX_ZCODE_RUNTIME", &runtime)
             .output()
             .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -2045,14 +2102,39 @@ console.log(JSON.stringify({ app, npm: npm.status, unknown: unknown.status }));
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(result["app"]["status"], "patched");
-        assert!(result["app"]["source"]
-            .as_str()
-            .unwrap()
-            .contains(r#"create:r(()=>x$C(z,{standalone:gDe(process.stderr)}),"create")"#));
-        assert_eq!(result["npm"], "native");
-        assert_eq!(result["unknown"], "unavailable");
+        let ran: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(ran["main"], true);
+        assert_eq!(ran["file"], runtime.to_str().unwrap());
+        assert_eq!(ran["args"], json!(["app-server", "--stdio"]));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("orx: ZCode app-server sign-in: unavailable"),
+            "{stderr}"
+        );
+        assert!(stderr.contains(STANDALONE_UNAVAILABLE), "{stderr}");
+    }
+
+    /// A turn that asked orx for account credentials, or ran on a build the
+    /// loader could not sign in, says so with the loader's status.
+    #[test]
+    fn a_host_credentials_request_explains_the_sign_in() {
+        let why = sign_in_failure(
+            HOST_CREDENTIALS,
+            "orx: ZCode app-server sign-in: patched\nother\n",
+        )
+        .unwrap();
+        assert!(why.contains("sign-in loader: patched"), "{why}");
+        let why = sign_in_failure(
+            "model_request_failed",
+            &format!("orx: ZCode app-server sign-in: unavailable\n{STANDALONE_UNAVAILABLE}\n"),
+        )
+        .unwrap();
+        assert!(why.contains("sign-in loader: unavailable"), "{why}");
+        assert!(sign_in_failure(
+            "project_token_login_failed",
+            "orx: ZCode app-server sign-in: patched"
+        )
+        .is_none());
     }
 
     /// The built-in catalog's Z.ai API template, as ZCode 3.15.3 ships it.
