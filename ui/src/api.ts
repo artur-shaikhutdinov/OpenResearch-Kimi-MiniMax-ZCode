@@ -1593,6 +1593,9 @@ export interface HarnessOptions {
   planActivation?: "permission" | "command" | null;
   reasoningLevels: OptionChoice[];
   defaultReasoningLevel?: string | null;
+  /** How the harness reaches its models: the composer's provider switch,
+   * offered even before a group has models (see {@link HarnessModel.providerGroup}). */
+  providerGroups?: OptionChoice[];
 }
 
 /**

@@ -34,7 +34,10 @@
   same turn in the composer's mode. Each chat runs on its own model
   (`session/setModel`); the ZCode app's default model is left alone.
   - The composer's Provider menu switches between Coding Plan and API key;
-    the Model menu then lists that provider's models.
+    the Model menu then lists that provider's models. Both are offered even
+    before they have models: one without models opens where it is set up
+    (Settings → Environment for a key, Settings → Agents for the sign-in).
+    The ZCode card in Settings → Agents shows each provider's state.
   - Coding Plan: signing in to the app is not enough. Outside the app the
     runtime needs its own sign-in, `zcode login` (Settings → Harnesses →
     ZCode → Sign in). Since ZCode 3.15 it saves an OAuth token

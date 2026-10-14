@@ -13,8 +13,17 @@ const models = [
 const label = (model) => model.displayName;
 
 test("provider groups come in catalog order, once each", () => {
-  assert.deepEqual(providerGroups(models), [plan, key]);
+  assert.deepEqual(providerGroups(models), [{ ...plan, available: true }, { ...key, available: true }]);
   assert.deepEqual(providerGroups(models.map(({ providerGroup, ...rest }) => rest)), []);
+});
+
+test("declared provider groups are offered before they have models", () => {
+  const planOnly = models.filter((entry) => entry.providerGroup === plan);
+  assert.deepEqual(providerGroups(planOnly, [plan, key]), [
+    { ...plan, available: true },
+    { ...key, available: false },
+  ]);
+  assert.deepEqual(providerGroups([], [plan, key]).map((group) => group.available), [false, false]);
 });
 
 test("switching provider keeps the model when the other provider has it", () => {

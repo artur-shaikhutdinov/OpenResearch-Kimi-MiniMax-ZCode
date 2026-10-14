@@ -112,6 +112,7 @@ export function ModelPicker({
   value,
   onSelect,
   onOpenSettings,
+  onOpenEnvironment,
   permissionChoices = [],
   defaultPermissionId,
   onSelectPermission,
@@ -129,6 +130,8 @@ export function ModelPicker({
   value: ModelSelection | null;
   onSelect: (value: ModelSelection) => void;
   onOpenSettings: () => void;
+  /** Settings → Environment, where an API key is added. */
+  onOpenEnvironment?: () => void;
   permissionChoices?: OptionChoice[];
   defaultPermissionId?: string | null;
   onSelectPermission?: (id: string) => void;
@@ -181,10 +184,12 @@ export function ModelPicker({
   }, [open, page]);
 
   const selectedHarness = harnesses.find((harness) => harness.id === value?.harness);
-  const providers = providerGroups(selectedHarness?.models ?? []);
+  const providers = providerGroups(selectedHarness?.models ?? [], selectedHarness?.options.providerGroups);
   const selectedProvider =
     providers.length > 1
-      ? selectedHarness?.models.find((entry) => entry.id === value?.model)?.providerGroup ?? providers[0]
+      ? selectedHarness?.models.find((entry) => entry.id === value?.model)?.providerGroup ??
+        providers.find((group) => group.available) ??
+        providers[0]
       : undefined;
 
   const groups = useMemo(() => {
@@ -279,11 +284,17 @@ export function ModelPicker({
     close();
   };
 
-  /** Switch provider: the same model there when it has it, else its first. */
+  /** Switch provider: the same model there when it has it, else its first.
+   * A provider with no models yet opens where it is set up instead. */
   const chooseProvider = (id: string) => {
     const next = selectedHarness && providerSwitchTarget(selectedHarness.models, value?.model, id, harnessModelLabel);
-    if (selectedHarness && next) pick(selectedHarness, next);
-    else close();
+    if (selectedHarness && next) {
+      pick(selectedHarness, next);
+      return;
+    }
+    close();
+    if (id === "api-key" && onOpenEnvironment) onOpenEnvironment();
+    else onOpenSettings();
   };
 
   const autonomyChoices: (OptionChoice & { id: Autonomy })[] = [
@@ -532,7 +543,15 @@ export function ModelPicker({
             <>
               {submenuHeader(m.model_picker_provider())}
               {choiceList(
-                providers.map((group) => ({ ...group, label: providerLabel(group) })),
+                providers.map((group) => ({
+                  id: group.id,
+                  label: providerLabel(group),
+                  description: group.available
+                    ? undefined
+                    : group.id === "api-key"
+                      ? m.model_picker_provider_needs_key({ keys: group.description ?? m.onboarding_api_key() })
+                      : m.model_picker_provider_needs_sign_in(),
+                })),
                 selectedProvider?.id,
                 undefined,
                 chooseProvider,

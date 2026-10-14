@@ -1,12 +1,25 @@
 import type { HarnessModel, OptionChoice } from "./api";
 
-/** The distinct provider groups of a harness's models, in catalog order. */
-export function providerGroups(models: readonly HarnessModel[]): OptionChoice[] {
+export interface ProviderGroup extends OptionChoice {
+  /** Whether any model is reachable this way yet (a key set, a plan signed in). */
+  available: boolean;
+}
+
+/** The provider groups of a harness: the ones it declares (offered even before
+ * they have models), then any other group its models carry, in catalog order. */
+export function providerGroups(
+  models: readonly HarnessModel[],
+  declared: readonly OptionChoice[] = [],
+): ProviderGroup[] {
   const seen = new Map<string, OptionChoice>();
+  for (const group of declared) if (!seen.has(group.id)) seen.set(group.id, group);
   for (const entry of models) {
     if (entry.providerGroup && !seen.has(entry.providerGroup.id)) seen.set(entry.providerGroup.id, entry.providerGroup);
   }
-  return [...seen.values()];
+  return [...seen.values()].map((group) => ({
+    ...group,
+    available: models.some((entry) => entry.providerGroup?.id === group.id),
+  }));
 }
 
 /** The model a provider switch lands on: the same model under the new

@@ -730,20 +730,33 @@ impl Harness for ZCode {
     }
 
     fn options(&self) -> HarnessOptions {
-        HarnessOptions::none().with_permission_choices(
-            vec![
-                OptionChoice::described("ask", "Ask", "Ask before changes and commands"),
+        HarnessOptions::none()
+            .with_permission_choices(
+                vec![
+                    OptionChoice::described("ask", "Ask", "Ask before changes and commands"),
+                    OptionChoice::described(
+                        "accept-edits",
+                        "Edit",
+                        "Allow file edits; ask before commands",
+                    ),
+                    OptionChoice::described("auto", "Auto", "Ask only when there is risk"),
+                    OptionChoice::described("bypass", "Full access", "Allow every tool"),
+                ],
+                "auto",
+                PlanActivation::Command,
+            )
+            .with_provider_groups(vec![
+                provider_group(false),
                 OptionChoice::described(
-                    "accept-edits",
-                    "Edit",
-                    "Allow file edits; ask before commands",
+                    "api-key",
+                    "API key",
+                    ENV_KEY_PROVIDERS
+                        .iter()
+                        .map(|(key, _)| *key)
+                        .collect::<Vec<_>>()
+                        .join(" / "),
                 ),
-                OptionChoice::described("auto", "Auto", "Ask only when there is risk"),
-                OptionChoice::described("bypass", "Full access", "Allow every tool"),
-            ],
-            "auto",
-            PlanActivation::Command,
-        )
+            ])
     }
 
     async fn resume_from_prompt(
