@@ -858,6 +858,21 @@ impl Turn<'_> {
                 }
             }
             Inbound::Notification { .. } => {}
+            // Only a host that owns the account answers this; orx runs the
+            // runtime signed in by itself, so a request here has no answer.
+            Inbound::Request { id, method, .. }
+                if method == "interaction/requestProviderRuntimeHeaders" =>
+            {
+                self.conn
+                    .respond(
+                        id,
+                        json!({
+                            "headersApplied": false,
+                            "errorMessage": "OpenResearch does not provide ZCode account credentials",
+                        }),
+                    )
+                    .await?;
+            }
             Inbound::Request { id, method, .. }
                 if method == "session/requestRuntimePreferences" =>
             {
@@ -1039,6 +1054,39 @@ fn model_selection(settings: &Value, wanted: &str, reasoning: Option<&str>) -> O
     (!same).then_some(selection)
 }
 
+/// Runs the desktop app's runtime through orx's loader, which starts its
+/// app-server signed in the way `zcode -p` is (see `zcode_app_server.cjs`).
+const APP_SERVER_LOADER: &str = include_str!("zcode_app_server.cjs");
+
+/// What the loader prints when this ZCode build cannot be signed in that way.
+const STANDALONE_UNAVAILABLE: &str = "orx: ZCode standalone sign-in unavailable";
+
+/// The app-server launch: the desktop runtime goes through the loader; a
+/// standalone CLI (the npm build signs in by itself) runs as it is.
+fn app_server_launch(launch: Launch) -> Result<Launch> {
+    let [runtime] = launch.prefix.as_slice() else {
+        return Ok(launch);
+    };
+    if !launch.bundled {
+        return Ok(launch);
+    }
+    let loader = crate::store::data_dir().join("zcode-app-server.cjs");
+    if std::fs::read_to_string(&loader).ok().as_deref() != Some(APP_SERVER_LOADER) {
+        std::fs::create_dir_all(crate::store::data_dir())?;
+        let tmp = loader.with_extension(format!("cjs.{}", uuid::Uuid::new_v4()));
+        std::fs::write(&tmp, APP_SERVER_LOADER)?;
+        std::fs::rename(&tmp, &loader)?;
+    }
+    let mut env = launch.env.clone();
+    env.push(("ORX_ZCODE_RUNTIME", runtime.clone()));
+    Ok(Launch {
+        program: launch.program,
+        prefix: vec![loader.into_os_string()],
+        env,
+        bundled: true,
+    })
+}
+
 async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     let launch = find_launch().ok_or_else(|| anyhow!("ZCode not found. {INSTALL_HINT}"))?;
     let project = ctx.project.clone();
@@ -1050,6 +1098,7 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     .map_err(|e| anyhow!("playbook task failed: {e}"))??;
 
     let log_name = format!("zcode-{}", uuid::Uuid::new_v4());
+    let launch = app_server_launch(launch)?;
     let mut cmd = launch.command();
     cmd.args(["app-server", "--stdio"])
         .current_dir(&repo)
@@ -1097,7 +1146,19 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
             let _ = ctx.flush();
             Ok(())
         }
-        Err(error) => Err(anyhow!("{error} (log: {})", log_path.display())),
+        Err(error) => {
+            let unavailable = std::fs::read_to_string(&log_path)
+                .is_ok_and(|log| log.contains(STANDALONE_UNAVAILABLE));
+            if unavailable {
+                return Err(anyhow!(
+                    "{error}\n\nOpenResearch cannot use ZCode's Coding Plan sign-in with this ZCode \
+                     version. Choose a model of a provider with an API key, or update OpenResearch. \
+                     (log: {})",
+                    log_path.display()
+                ));
+            }
+            Err(anyhow!("{error} (log: {})", log_path.display()))
+        }
     }
 }
 
@@ -1786,6 +1847,50 @@ mod tests {
             Some(json!({"providerId": "account:zai-individual-coding-plan", "modelId": "GLM-5.3"}))
         );
         assert_eq!(model_selection(settings, "no-provider", None), None);
+    }
+
+    /// The loader's patch on the shapes of bundle it meets: the app's
+    /// app-server call (patched to the CLI's standalone sign-in), the npm
+    /// build that already chooses its sign-in, and a build it does not know.
+    #[test]
+    fn the_loader_signs_the_app_server_in_like_the_cli() {
+        let Some(node) = crate::local::shell_env::find_on_path("node") else {
+            eprintln!("node not found; skipping the loader test");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("orx-zcode-loader-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let loader = dir.join("loader.cjs");
+        std::fs::write(&loader, APP_SERVER_LOADER).unwrap();
+        let script = r#"
+const { standalone } = require(process.argv[1]);
+const names = 'r(x$C,"startProcessProviderRegistryRuntime");r(gDe,"createCliProviderRefreshReporter");';
+const call = 'U=await FUe({create:r(()=>x$C(z),"create"),disposeLate:r(e=>e.dispose(),"disposeLate")}),u.info("Worker Provider Registry \\u5DF2\\u5C31\\u7EEA")';
+const app = standalone(names + call);
+const npm = standalone(names + 'create:r(()=>x$C(z,require("cli-config.cjs").appServerRegistryOptions(z,gDe)),"create"),u.info("Worker Provider Registry \\u5DF2\\u5C31\\u7EEA")');
+const unknown = standalone(names + 'create:r(()=>other(z),"create"),u.info("Worker Provider Registry \\u5DF2\\u5C31\\u7EEA")');
+console.log(JSON.stringify({ app, npm: npm.status, unknown: unknown.status }));
+"#;
+        let output = std::process::Command::new(node)
+            .arg("-e")
+            .arg(script)
+            .arg(&loader)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["app"]["status"], "patched");
+        assert!(result["app"]["source"]
+            .as_str()
+            .unwrap()
+            .contains(r#"create:r(()=>x$C(z,{standalone:gDe(process.stderr)}),"create")"#));
+        assert_eq!(result["npm"], "native");
+        assert_eq!(result["unknown"], "unavailable");
     }
 
     #[test]
