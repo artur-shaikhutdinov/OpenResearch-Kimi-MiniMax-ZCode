@@ -909,6 +909,8 @@
   "model_picker_effort": "میزان استدلال",
   "model_picker_speed": "سرعت",
   "model_picker_mode": "حالت",
+  "model_picker_provider": "ارائه‌دهنده",
+  "model_picker_plan_description": "ابتدا بررسی می‌کند و طرحی برای تأیید پیشنهاد می‌دهد",
   "model_picker_autonomy": "خودمختاری",
   "model_picker_autonomy_agentic": "خودکار",
   "model_picker_autonomy_agentic_description": "پژوهش را خودش پیش می‌برد و در صورت نیاز با شما هماهنگ می‌کند.",

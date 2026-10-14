@@ -915,6 +915,8 @@
   "model_picker_effort": "Esfuerzo",
   "model_picker_speed": "Velocidad",
   "model_picker_mode": "Modo",
+  "model_picker_provider": "Proveedor",
+  "model_picker_plan_description": "Primero investiga y propone un plan para aprobar",
   "model_picker_autonomy": "Autonomía",
   "model_picker_autonomy_agentic": "Agéntico",
   "model_picker_autonomy_agentic_description": "Dirige la investigación por su cuenta y consulta cuando hace falta.",

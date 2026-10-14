@@ -914,6 +914,8 @@
   "model_picker_effort": "الجهد",
   "model_picker_speed": "السرعة",
   "model_picker_mode": "الوضع",
+  "model_picker_provider": "المزوّد",
+  "model_picker_plan_description": "يستكشف أولًا ويقترح خطة للموافقة عليها",
   "model_picker_autonomy": "الاستقلالية",
   "model_picker_autonomy_agentic": "وكيل مستقل",
   "model_picker_autonomy_agentic_description": "يدير البحث بنفسه ويراجعك عند الحاجة.",

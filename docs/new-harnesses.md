@@ -25,7 +25,7 @@
   - Edit is `edit`: file edits run, and it asks before commands.
   - Auto (the default) is `guarded`: it asks only when there is risk.
   - Full access is `yolo`.
-  - `/plan` is ZCode's read-only `plan` mode.
+  - Plan (in the Mode menu, or `/plan`) is ZCode's read-only `plan` mode.
 
   ZCode before 3.15 has no `guarded` mode, so Auto runs in `edit` there.
 
@@ -33,12 +33,27 @@
   question and plan cards while the turn waits. An approved plan continues the
   same turn in the composer's mode. Each chat runs on its own model
   (`session/setModel`); the ZCode app's default model is left alone.
-  - Signing in to the app is not enough: outside the app the runtime needs its
-    own sign-in, `zcode login` (Settings → Harnesses → ZCode → Sign in). Since
-    ZCode 3.15 it saves an OAuth token (`auth-source` `oauth`); earlier
-    versions saved the Coding Plan key. It covers the Z.ai Individual Coding
-    Plan. Alternatively enable a provider with an API key in the app (Z.ai API
-    billed from the balance, or Z.ai Coding Plan with an active Coding Plan).
+  - The composer's Provider menu switches between Coding Plan and API key;
+    the Model menu then lists that provider's models.
+  - Coding Plan: signing in to the app is not enough. Outside the app the
+    runtime needs its own sign-in, `zcode login` (Settings → Harnesses →
+    ZCode → Sign in). Since ZCode 3.15 it saves an OAuth token
+    (`auth-source` `oauth`); earlier versions saved the Coding Plan key. It
+    covers the Z.ai Individual Coding Plan.
+    The app's runtime runs its app-server as the app's helper: the app
+    supplies the account. orx starts it through a small loader
+    (`src/local/harness/zcode_app_server.cjs`) that, in memory, starts the
+    provider registry the way `zcode -p` does, reading `zcode login`'s
+    sign-in. A ZCode build where the loader finds nothing to change prints
+    `orx: ZCode standalone sign-in unavailable`; API-key providers still work
+    there, and a Coding Plan turn says so.
+  - API key: set `ZAI_API_KEY` (Z.ai API, billed from the balance) or
+    `BIGMODEL_API_KEY` (BigModel API) in Settings → Environment, as for the
+    other harnesses. The runtime reads no key from the environment, so for
+    each turn orx writes its own copy of the app's `provider_config.json`
+    with that provider added (mode 0600, in orx's data directory) and points
+    `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` at it; the app's files are left
+    alone. Providers with a key enabled in the ZCode app are listed too.
   - Start Plan works only inside the app: its endpoint
     (`zcode.z.ai/api/v1/zcode-plan`) needs a captcha token the app obtains, and
     the Coding Plan endpoints answer `1113` for a Start Plan account.
@@ -53,7 +68,8 @@
     with another account replaces the key, and turns fail with "Select a
     model"; orx then shows ZCode as not signed in and asks for `zcode login`.
   - The composer lists the models of each signed-in plan (from the app's
-    built-in provider catalog) and of each enabled API-key provider.
+    built-in provider catalog) and of each API-key provider (the models its
+    template enables).
 
 The rest of this file is the integration notes.
 

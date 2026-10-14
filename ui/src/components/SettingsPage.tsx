@@ -2334,7 +2334,7 @@ function HfHintRow() {
 
 // Keys runs typically need (HF_TOKEN is also read by orx itself), always
 // shown as rows alongside custom variables.
-const RECOMMENDED_ENV_KEYS = ["TINKER_API_KEY", "HF_TOKEN", "WANDB_API_KEY"];
+const RECOMMENDED_ENV_KEYS = ["TINKER_API_KEY", "HF_TOKEN", "WANDB_API_KEY", "ZAI_API_KEY", "BIGMODEL_API_KEY"];
 
 function showEnvError(name: string, err: unknown) {
   const message = err instanceof Error ? err.message : String(err);

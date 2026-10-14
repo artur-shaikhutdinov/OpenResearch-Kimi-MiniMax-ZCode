@@ -915,6 +915,8 @@
   "model_picker_effort": "推論レベル",
   "model_picker_speed": "速度",
   "model_picker_mode": "モード",
+  "model_picker_provider": "プロバイダー",
+  "model_picker_plan_description": "まず調査し、承認用のプランを提案します",
   "model_picker_autonomy": "自律性",
   "model_picker_autonomy_agentic": "自律エージェント",
   "model_picker_autonomy_agentic_description": "自律的に研究を進め、必要に応じて確認します。",

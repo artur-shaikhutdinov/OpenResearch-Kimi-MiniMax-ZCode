@@ -915,6 +915,8 @@
   "model_picker_effort": "Poziom rozumowania",
   "model_picker_speed": "Szybkość",
   "model_picker_mode": "Tryb",
+  "model_picker_provider": "Dostawca",
+  "model_picker_plan_description": "Najpierw bada i proponuje plan do zatwierdzenia",
   "model_picker_autonomy": "Samodzielność",
   "model_picker_autonomy_agentic": "Samodzielny agent",
   "model_picker_autonomy_agentic_description": "Samodzielnie prowadzi badania i konsultuje się z Tobą, gdy to konieczne.",

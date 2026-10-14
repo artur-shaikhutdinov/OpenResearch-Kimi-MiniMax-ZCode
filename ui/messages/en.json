@@ -915,6 +915,8 @@
   "model_picker_effort": "Effort",
   "model_picker_speed": "Speed",
   "model_picker_mode": "Mode",
+  "model_picker_provider": "Provider",
+  "model_picker_plan_description": "Investigate first and propose a plan to approve",
   "model_picker_autonomy": "Autonomy",
   "model_picker_autonomy_agentic": "Agentic",
   "model_picker_autonomy_agentic_description": "Runs the research on its own and checks in when needed.",

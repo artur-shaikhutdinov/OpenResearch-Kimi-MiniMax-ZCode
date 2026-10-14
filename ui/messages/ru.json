@@ -915,6 +915,8 @@
   "model_picker_effort": "Усилие",
   "model_picker_speed": "Скорость",
   "model_picker_mode": "Режим",
+  "model_picker_provider": "Провайдер",
+  "model_picker_plan_description": "Сначала изучает и предлагает план на утверждение",
   "model_picker_autonomy": "Самостоятельность",
   "model_picker_autonomy_agentic": "Агент",
   "model_picker_autonomy_agentic_description": "Ведёт исследование сам и обращается к вам, когда нужно.",

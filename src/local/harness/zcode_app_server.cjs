@@ -14,6 +14,7 @@
 // providers still work) and says so on stderr, which orx reads back.
 "use strict";
 
+const fs = require("node:fs");
 const Module = require("node:module");
 const path = require("node:path");
 
@@ -60,9 +61,18 @@ if (require.main === module) {
     process.exit(2);
   }
   const target = path.resolve(runtime);
+  // Node loads the main module by its real path.
+  const real = (file) => {
+    try {
+      return fs.realpathSync(file);
+    } catch {
+      return path.resolve(file);
+    }
+  };
+  const runtimeFile = real(target);
   const compile = Module.prototype._compile;
   Module.prototype._compile = function (content, filename) {
-    if (path.resolve(filename) !== target) return compile.call(this, content, filename);
+    if (real(filename) !== runtimeFile) return compile.call(this, content, filename);
     Module.prototype._compile = compile;
     const result = standalone(content);
     if (result.status === "unavailable") process.stderr.write(`${UNAVAILABLE}\n`);

@@ -909,6 +909,8 @@
   "model_picker_effort": "推理强度",
   "model_picker_speed": "速度",
   "model_picker_mode": "模式",
+  "model_picker_provider": "提供方",
+  "model_picker_plan_description": "先调查，再提出待批准的计划",
   "model_picker_autonomy": "自主程度",
   "model_picker_autonomy_agentic": "自主",
   "model_picker_autonomy_agentic_description": "独立推进研究，必要时再与你确认。",
