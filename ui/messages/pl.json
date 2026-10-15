@@ -1232,6 +1232,7 @@
   "harness_setup_title": "Skonfiguruj {agent}",
   "harness_setup_install": "Zainstaluj",
   "harness_setup_login": "Zaloguj się",
+  "harness_setup_login_again": "Zaloguj ponownie",
   "harness_setup_checking": "Sprawdzanie połączenia…",
   "harness_setup_connected": "Agent {agent} jest połączony.",
   "harness_setup_not_ready": "Agent nie jest jeszcze gotowy. Sprawdź ponownie lub spróbuj jeszcze raz się zalogować.",

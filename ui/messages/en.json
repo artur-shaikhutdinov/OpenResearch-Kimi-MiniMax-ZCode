@@ -1232,6 +1232,7 @@
   "harness_setup_title": "Set up {agent}",
   "harness_setup_install": "Install",
   "harness_setup_login": "Sign in",
+  "harness_setup_login_again": "Sign in again",
   "harness_setup_checking": "Checking connection…",
   "harness_setup_connected": "{agent} is connected.",
   "harness_setup_not_ready": "The agent is not ready yet. Re-check or retry sign-in.",

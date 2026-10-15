@@ -1232,6 +1232,7 @@
   "harness_setup_title": "{agent} सेट अप करें",
   "harness_setup_install": "इंस्टॉल करें",
   "harness_setup_login": "साइन इन करें",
+  "harness_setup_login_again": "फिर से साइन इन करें",
   "harness_setup_checking": "कनेक्शन जाँचा जा रहा है…",
   "harness_setup_connected": "{agent} कनेक्टेड है।",
   "harness_setup_not_ready": "एजेंट अभी तैयार नहीं है। फिर से जाँचें या साइन-इन फिर से कोशिश करें।",

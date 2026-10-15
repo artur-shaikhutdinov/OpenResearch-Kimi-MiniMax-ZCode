@@ -472,6 +472,13 @@ function HarnessesTab({ remote }: { remote: boolean }) {
                 <SquareTerminal size={14} /> {m.harness_setup_login()}
               </Button>
             )}
+            {/* ZCode's command-line sign-in can lapse while its file stays: Z.ai
+                then refuses it, and only a new `zcode login` helps. */}
+            {!remote && h.id === "zcode" && h.installed && !h.installBroken && h.authenticated && h.authMethod === "oauth" && (
+              <Button size="small" onClick={() => setSetupHarness(h)} disabled={!setupCommands.data} aria-haspopup="dialog">
+                <SquareTerminal size={14} /> {m.harness_setup_login_again()}
+              </Button>
+            )}
             <Button size="small" onClick={() => load(true, true)} disabled={refreshing}>
               <RefreshCw size={12} className={refreshing ? "animate-[spin_0.9s_linear_infinite]" : ""} /> {m.settings_page_refresh()}
             </Button>

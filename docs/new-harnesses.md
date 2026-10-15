@@ -69,6 +69,10 @@
     nothing in a terminal) and opens the printed URL.
   - With no usable provider a turn fails with "Select a model before
     continuing"; a provider without a plan or balance fails with `1113`.
+  - `project_token_login_failed`: Z.ai refused the token `zcode login` saved
+    (the runtime trades it at `api.z.ai/api/auth/z/login` for a project
+    token). orx cannot tell offline, so ZCode still shows as signed in; the
+    turn says to sign in again, and the ZCode card has Sign in again.
   - The runtime uses a plan only when its API key in `credentials.json` is
     saved under the identity `zcode login` recorded. Signing in to the app
     with another account replaces the key, and turns fail with "Select a

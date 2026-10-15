@@ -1232,6 +1232,7 @@
   "harness_setup_title": "راه‌اندازی {agent}",
   "harness_setup_install": "نصب",
   "harness_setup_login": "ورود",
+  "harness_setup_login_again": "ورود دوباره",
   "harness_setup_checking": "در حال بررسی اتصال…",
   "harness_setup_connected": "{agent} متصل است.",
   "harness_setup_not_ready": "عامل هنوز آماده نیست. دوباره بررسی کنید یا ورود را تکرار کنید.",

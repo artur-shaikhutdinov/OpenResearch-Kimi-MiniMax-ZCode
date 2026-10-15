@@ -1232,6 +1232,7 @@
   "harness_setup_title": "设置 {agent}",
   "harness_setup_install": "安装",
   "harness_setup_login": "登录",
+  "harness_setup_login_again": "重新登录",
   "harness_setup_checking": "正在检查连接…",
   "harness_setup_connected": "{agent} 已连接。",
   "harness_setup_not_ready": "代理尚未就绪。请重新检查或重试登录。",

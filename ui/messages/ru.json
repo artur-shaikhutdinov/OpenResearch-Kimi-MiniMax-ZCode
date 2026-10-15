@@ -1232,6 +1232,7 @@
   "harness_setup_title": "Настройка {agent}",
   "harness_setup_install": "Установить",
   "harness_setup_login": "Войти",
+  "harness_setup_login_again": "Войти снова",
   "harness_setup_checking": "Проверка подключения…",
   "harness_setup_connected": "{agent} подключён.",
   "harness_setup_not_ready": "Агент ещё не готов. Проверьте снова или повторите вход.",

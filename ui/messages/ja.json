@@ -1232,6 +1232,7 @@
   "harness_setup_title": "{agent} を設定",
   "harness_setup_install": "インストール",
   "harness_setup_login": "サインイン",
+  "harness_setup_login_again": "再度サインイン",
   "harness_setup_checking": "接続を確認中…",
   "harness_setup_connected": "{agent} は接続済みです。",
   "harness_setup_not_ready": "エージェントはまだ準備できていません。再確認するか、サインインを再試行してください。",

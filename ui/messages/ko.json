@@ -1232,6 +1232,7 @@
   "harness_setup_title": "{agent} 설정",
   "harness_setup_install": "설치",
   "harness_setup_login": "로그인",
+  "harness_setup_login_again": "다시 로그인",
   "harness_setup_checking": "연결 확인 중…",
   "harness_setup_connected": "{agent}이(가) 연결되었습니다.",
   "harness_setup_not_ready": "에이전트가 아직 준비되지 않았습니다. 다시 확인하거나 로그인을 다시 시도하세요.",

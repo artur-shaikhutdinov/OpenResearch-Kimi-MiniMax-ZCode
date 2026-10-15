@@ -1565,6 +1565,18 @@ fn explain_failure(message: String, log_path: &Path) -> String {
             log_path.display()
         );
     }
+    // The runtime's own Coding Plan sign-in: Z.ai refused the token `zcode
+    // login` saved (it lapsed, or another sign-in replaced it), or it is gone.
+    if message.contains("project_token_login_failed")
+        || message.contains("project_token_login_required")
+    {
+        return format!(
+            "{message}\n\nZ.ai did not accept ZCode's command-line sign-in (`zcode login`): it may \
+             have expired. Sign in again under Settings → Agents → ZCode → Sign in again, then \
+             continue. Log: {}",
+            log_path.display()
+        );
+    }
     // Z.ai's "Insufficient balance or no resource package": the chosen
     // provider has no plan or balance behind it for this model.
     if message.contains("[1113]") {
@@ -2148,6 +2160,17 @@ console.log(JSON.stringify({ app, npm: npm.status, noFactory: noFactory.status, 
             "orx: ZCode app-server sign-in: patched"
         )
         .is_none());
+    }
+
+    /// A refused `zcode login` token says how to sign in again.
+    #[test]
+    fn a_refused_sign_in_asks_to_sign_in_again() {
+        let explained = explain_failure(
+            "project_token_login_failed".into(),
+            Path::new("/tmp/zcode.log"),
+        );
+        assert!(explained.contains("Sign in again"), "{explained}");
+        assert!(explained.contains("/tmp/zcode.log"), "{explained}");
     }
 
     /// The built-in catalog's Z.ai API template, as ZCode 3.15.3 ships it.

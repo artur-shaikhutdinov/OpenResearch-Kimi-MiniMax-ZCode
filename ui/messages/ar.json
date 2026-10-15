@@ -1237,6 +1237,7 @@
   "harness_setup_install_preview": "سيؤدي هذا إلى تنزيل {agent} وتثبيته على جهازك. وافق لتشغيل الأمر أدناه.",
   "harness_setup_load_failed": "تعذّر تحميل أوامر الإعداد.",
   "harness_setup_login": "تسجيل الدخول",
+  "harness_setup_login_again": "تسجيل الدخول مجددًا",
   "harness_setup_not_ready": "وكيل البرمجة غير جاهز بعد. أعد التحقق ثم حاول مجددًا.",
   "harness_setup_opens_terminal": "يفتح طرفية هنا",
   "harness_setup_requires_npm": "يلزم تثبيت Node.js وnpm لتشغيل هذا الأمر.",
