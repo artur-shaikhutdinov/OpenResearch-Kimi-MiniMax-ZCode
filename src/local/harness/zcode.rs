@@ -45,7 +45,7 @@ const KEY: &str = "zcode";
 const INSTALL_HINT: &str =
     "Install the ZCode desktop app from https://zcode.z.ai and sign in there, then re-check this harness.";
 const LOGIN_HINT: &str =
-    "Sign in for command-line use with `zcode login` (Z.ai Individual or Team Coding Plan), or use an API key: set ZAI_API_KEY (or BIGMODEL_API_KEY) in Settings → Environment, or enable a provider with a key in the ZCode app. Then re-check this harness. Start Plan works only inside the ZCode app.";
+    "Sign in for command-line use with `zcode login` (Z.ai Individual or Team Coding Plan), or use an API key: add a provider with an API key in the ZCode app (Settings → Providers). Then re-check this harness. Start Plan works only inside the ZCode app.";
 const OTHER_ACCOUNT_HINT: &str =
     "ZCode's command-line sign-in belongs to a different Z.ai account than the plan key ZCode saved last, so its runtime finds no model. Sign in again with `zcode login` using the account that has the plan, then re-check this harness.";
 const VERSION_TIMEOUT: Duration = Duration::from_secs(20);
@@ -280,7 +280,7 @@ fn keyed_providers(config: &Value) -> Vec<&Value> {
 
 /// How ZCode's runtime can reach a model: through a signed-in plan, or only
 /// through providers with an API key.
-fn access(home: &Path, builtin: Option<&Value>) -> (Access, bool) {
+fn access(home: &Path) -> (Access, bool) {
     let plan = super::detect::read_json(home.join("v2").join("credentials.json"))
         .and_then(|store| {
             store
@@ -291,26 +291,12 @@ fn access(home: &Path, builtin: Option<&Value>) -> (Access, bool) {
     if plan == Access::Ready {
         return (plan, false);
     }
-    let keyed = provider_config(home, builtin, env_key)
-        .is_some_and(|config| !keyed_providers(&config).is_empty());
+    let keyed = provider_config(home).is_some_and(|config| !keyed_providers(&config).is_empty());
     if keyed {
         (Access::Ready, true)
     } else {
         (plan, false)
     }
-}
-
-/// API keys the other agents' way: set in Settings → Environment (or the
-/// process environment), each enabling one of the ZCode app's built-in
-/// API-key providers. ZCode's runtime reads no key from the environment, so
-/// orx adds the provider to the configuration it hands the runtime.
-const ENV_KEY_PROVIDERS: &[(&str, &str)] = &[
-    ("ZAI_API_KEY", "zai-standard-api"),
-    ("BIGMODEL_API_KEY", "bigmodel-standard-api"),
-];
-
-fn env_key(name: &str) -> Option<String> {
-    super::detect::api_key(name)
 }
 
 /// The built-in template `id`.
@@ -322,103 +308,10 @@ fn template<'a>(builtin: Option<&'a Value>, id: &str) -> Option<&'a Value> {
         .find(|rule| rule.get("templateId").and_then(Value::as_str) == Some(id))
 }
 
-/// ZCode's provider configuration as the runtime should see it: the app's
-/// `provider_config.json`, plus a provider for each environment key whose
-/// template the app has no provider of its own for. `None` when there is
-/// neither.
-fn provider_config(
-    home: &Path,
-    builtin: Option<&Value>,
-    key: impl Fn(&str) -> Option<String>,
-) -> Option<Value> {
-    let file = super::detect::read_json(home.join("v2").join("provider_config.json"));
-    let configured = |id: &str| {
-        file.as_ref()
-            .and_then(|config| config.pointer("/config/providerConfigRules/providerRules"))
-            .and_then(Value::as_array)
-            .is_some_and(|rules| {
-                rules
-                    .iter()
-                    .any(|rule| rule.get("providerId").and_then(Value::as_str) == Some(id))
-            })
-    };
-    let added: Vec<Value> = ENV_KEY_PROVIDERS
-        .iter()
-        .filter(|(_, id)| !configured(id))
-        .filter_map(|(name, id)| {
-            let api_key = key(name)?;
-            let template = template(builtin, id);
-            let label = template
-                .and_then(|t| t.pointer("/templateNameMap/en-US"))
-                .and_then(Value::as_str)
-                .unwrap_or(id);
-            let access = template
-                .and_then(|t| t.pointer("/config/access/type"))
-                .and_then(Value::as_str)
-                .unwrap_or("api-key");
-            // The runtime only lists a personal provider in its own group.
-            Some(json!({
-                "providerId": id,
-                "templateId": id,
-                "providerName": label,
-                "enabled": true,
-                "config": {
-                    "group": "standard-personal",
-                    "access": {"type": access, "apiKey": api_key},
-                },
-            }))
-        })
-        .collect();
-    if added.is_empty() {
-        return file;
-    }
-    let mut config = file.unwrap_or_else(|| {
-        json!({
-            "schemaVersion": 1,
-            "config": {
-                "providerConfigRules": {"providerRules": []},
-                "modelConfigRules": {"providerModelRules": [], "manualProviderModelRules": []},
-            },
-        })
-    });
-    let rules = config
-        .pointer_mut("/config/providerConfigRules/providerRules")
-        .and_then(Value::as_array_mut)?;
-    rules.extend(added);
-    Some(config)
-}
-
-/// The configuration file for the runtime when environment keys add
-/// providers to it (orx's own copy; the app's file is left alone), else
-/// `None`.
-fn env_provider_config_file(home: &Path, builtin: Option<&Value>) -> Result<Option<PathBuf>> {
-    let file = super::detect::read_json(home.join("v2").join("provider_config.json"));
-    let Some(config) =
-        provider_config(home, builtin, env_key).filter(|config| Some(config) != file.as_ref())
-    else {
-        return Ok(None);
-    };
-    let dir = crate::store::data_dir();
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("zcode-provider-config.json");
-    let tmp = path.with_extension(format!("json.{}", uuid::Uuid::new_v4()));
-    write_private(&tmp, &serde_json::to_vec_pretty(&config)?)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(Some(path))
-}
-
-/// Write a file only its owner can read: it holds API keys.
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path)?.write_all(bytes)?;
-    Ok(())
+/// The ZCode app's provider configuration: the providers set up in the app,
+/// with their API keys (ZCode keeps them there; orx stores none).
+fn provider_config(home: &Path) -> Option<Value> {
+    super::detect::read_json(home.join("v2").join("provider_config.json"))
 }
 
 /// The runtime's built-in provider catalog: the app's file, handed to the
@@ -501,7 +394,7 @@ fn catalog(home: &Path, builtin: Option<&Value>) -> Vec<ModelInfo> {
             }
         }
     }
-    if let Some(config) = provider_config(home, builtin, env_key) {
+    if let Some(config) = provider_config(home) {
         for rule in keyed_providers(&config) {
             let Some(provider) = rule.get("providerId").and_then(Value::as_str) else {
                 continue;
@@ -670,9 +563,8 @@ impl ZCode {
                 }
             }
             if !info.install_broken {
-                let (access, api_key) = zcode_home().map_or((Access::None, false), |home| {
-                    access(&home, builtin.as_ref())
-                });
+                let (access, api_key) =
+                    zcode_home().map_or((Access::None, false), |home| access(&home));
                 match access {
                     Access::Ready => {
                         info.authenticated = true;
@@ -745,18 +637,7 @@ impl Harness for ZCode {
                 "auto",
                 PlanActivation::Command,
             )
-            .with_provider_groups(vec![
-                provider_group(false),
-                OptionChoice::described(
-                    "api-key",
-                    "API key",
-                    ENV_KEY_PROVIDERS
-                        .iter()
-                        .map(|(key, _)| *key)
-                        .collect::<Vec<_>>()
-                        .join(" / "),
-                ),
-            ])
+            .with_provider_groups(vec![provider_group(false), provider_group(true)])
     }
 
     async fn resume_from_prompt(
@@ -1298,15 +1179,6 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     // prepare_env may reset the environment; the launch's own variables win.
     for (key, value) in &launch.env {
         cmd.env(key, value);
-    }
-    // Providers from environment keys reach the runtime through orx's copy of
-    // its configuration, which needs the built-in catalog named beside it.
-    if let (Some(home), Some(builtin_path)) = (zcode_home(), builtin_catalog(&launch)) {
-        let builtin = super::detect::read_json(builtin_path.clone());
-        if let Some(config) = env_provider_config_file(&home, builtin.as_ref())? {
-            cmd.env("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE", builtin_path);
-            cmd.env("ZCODE_PERSONAL_PROVIDER_CONFIG_FILE", config);
-        }
     }
     cmd.env("NO_COLOR", "1");
     set_chat_session_env(&mut cmd, &ctx.session_id, KEY, ctx.host.up_port());
@@ -2190,34 +2062,6 @@ console.log(JSON.stringify({ app, npm: npm.status, noFactory: noFactory.status, 
     }
 
     #[test]
-    fn an_environment_key_adds_its_provider_for_the_runtime() {
-        let dir = std::env::temp_dir().join(format!("orx-zcode-env-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(dir.join("v2")).unwrap();
-        let builtin = zai_api_catalog();
-        let key = |name: &str| (name == "ZAI_API_KEY").then(|| "sk-zai".to_string());
-        // No key and no file: nothing for the runtime.
-        assert_eq!(provider_config(&dir, Some(&builtin), |_| None), None);
-        let config = provider_config(&dir, Some(&builtin), key).unwrap();
-        assert_eq!(
-            config.pointer("/config/providerConfigRules/providerRules"),
-            Some(&json!([{
-                "providerId": "zai-standard-api",
-                "templateId": "zai-standard-api",
-                "providerName": "Z.ai API",
-                "enabled": true,
-                "config": {"group": "standard-personal", "access": {"type": "api-key", "apiKey": "sk-zai"}},
-            }]))
-        );
-        assert_eq!(keyed_providers(&config).len(), 1);
-        // A provider the ZCode app configured itself is left to it.
-        let own = json!({"schemaVersion": 1, "config": {"providerConfigRules": {"providerRules": [
-            {"providerId": "zai-standard-api", "enabled": false, "config": {"access": {"type": "api-key", "apiKey": "sk-app"}}}]}}});
-        std::fs::write(dir.join("v2").join("provider_config.json"), own.to_string()).unwrap();
-        assert_eq!(provider_config(&dir, Some(&builtin), key), Some(own));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn the_catalog_groups_models_by_how_zcode_reaches_them() {
         let dir = std::env::temp_dir().join(format!("orx-zcode-groups-{}", uuid::Uuid::new_v4()));
         let v2 = dir.join("v2");
@@ -2251,10 +2095,20 @@ console.log(JSON.stringify({ app, npm: npm.status, noFactory: noFactory.status, 
             ]
             .map(|(id, group)| (id.to_string(), group.to_string()))
         );
+        // A provider the app has without a key, or switched off, offers nothing.
+        for rule in [
+            json!({"providerId": "zai-standard-api", "templateId": "zai-standard-api",
+                   "config": {"group": "standard-personal", "access": {"type": "api-key", "apiKey": null}}}),
+            json!({"providerId": "zai-standard-api", "templateId": "zai-standard-api", "enabled": false,
+                   "config": {"group": "standard-personal", "access": {"type": "api-key", "apiKey": "sk"}}}),
+        ] {
+            let config = json!({"config": {"providerConfigRules": {"providerRules": [rule]}}});
+            assert!(keyed_providers(&config).is_empty());
+        }
         // The plan's sign-in makes ZCode ready, not the key.
-        assert_eq!(access(&dir, Some(&builtin)), (Access::Ready, false));
+        assert_eq!(access(&dir), (Access::Ready, false));
         std::fs::remove_file(v2.join("credentials.json")).unwrap();
-        assert_eq!(access(&dir, Some(&builtin)), (Access::Ready, true));
+        assert_eq!(access(&dir), (Access::Ready, true));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2467,34 +2321,34 @@ console.log(JSON.stringify({ app, npm: npm.status, noFactory: noFactory.status, 
         let dir = std::env::temp_dir().join(format!("orx-zcode-home-{}", uuid::Uuid::new_v4()));
         let v2 = dir.join("v2");
         std::fs::create_dir_all(&v2).unwrap();
-        assert!(!(access(&dir, None).0 == Access::Ready));
+        assert!(!(access(&dir).0 == Access::Ready));
         // The desktop app's sign-in alone: OAuth tokens and plan keys, but no
         // identity the command-line runtime can pair them with.
         let app_only = r#"{"oauth:zai:access_token":"enc:v1:a.b.c","zcodejwttoken":"enc:v1:a.b.c",
             "account-provider:coding-plan:account:zai-team-coding-plan:account:u1:api-key":"enc:v1:a.b.c"}"#;
         std::fs::write(v2.join("credentials.json"), app_only).unwrap();
-        assert!(!(access(&dir, None).0 == Access::Ready));
+        assert!(!(access(&dir).0 == Access::Ready));
         let disabled = r#"{"config":{"providerConfigRules":{"providerRules":[{"providerId":"zai-api","enabled":false,"config":{"access":{"type":"zhipu-coding-plan-api-key","apiKey":"id.secret"}}}]}}}"#;
         std::fs::write(v2.join("provider_config.json"), disabled).unwrap();
-        assert!(!(access(&dir, None).0 == Access::Ready));
+        assert!(!(access(&dir).0 == Access::Ready));
         std::fs::write(
             v2.join("provider_config.json"),
             r#"{"config":{"providerConfigRules":{"providerRules":[{"providerId":"c","config":{"access":{"type":"api-key","apiKey":"sk"}}}]}}}"#,
         )
         .unwrap();
-        assert!((access(&dir, None).0 == Access::Ready));
+        assert!((access(&dir).0 == Access::Ready));
         std::fs::remove_file(v2.join("provider_config.json")).unwrap();
         // An identity whose plan has no API key does not reach a model either.
         let identity_only =
             r#"{"account-provider:account:zai-individual-coding-plan:identity":"enc:v1:a.b.c"}"#;
         std::fs::write(v2.join("credentials.json"), identity_only).unwrap();
-        assert!(!(access(&dir, None).0 == Access::Ready));
+        assert!(!(access(&dir).0 == Access::Ready));
         // ZCode 3.15's sign-in pairs the identity with the OAuth token instead.
         let oauth = r#"{"account-provider:account:zai-individual-coding-plan:identity":"enc:v1:a.b.c",
             "account-provider:account:zai-individual-coding-plan:auth-source":"oauth",
             "oauth:zai:access_token":"enc:v1:a.b.c"}"#;
         std::fs::write(v2.join("credentials.json"), oauth).unwrap();
-        assert!((access(&dir, None).0 == Access::Ready));
+        assert!((access(&dir).0 == Access::Ready));
         // `zcode login` adds the identity for its plan.
         let cli = app_only.replace(
             "}",
@@ -2502,7 +2356,7 @@ console.log(JSON.stringify({ app, npm: npm.status, noFactory: noFactory.status, 
             "account-provider:coding-plan:account:zai-individual-coding-plan:account:u1:api-key":"enc:v1:a.b.c"}"#,
         );
         std::fs::write(v2.join("credentials.json"), cli).unwrap();
-        assert!((access(&dir, None).0 == Access::Ready));
+        assert!((access(&dir).0 == Access::Ready));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

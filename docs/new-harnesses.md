@@ -35,9 +35,8 @@
   (`session/setModel`); the ZCode app's default model is left alone.
   - The composer's Provider menu switches between Coding Plan and API key;
     the Model menu then lists that provider's models. Both are offered even
-    before they have models: one without models opens where it is set up
-    (Settings → Environment for a key, Settings → Agents for the sign-in).
-    The ZCode card in Settings → Agents shows each provider's state.
+    before they have models: one without models opens Settings → Agents,
+    whose ZCode card shows each provider's state and what it needs.
   - Coding Plan: signing in to the app is not enough. Outside the app the
     runtime needs its own sign-in, `zcode login` (Settings → Harnesses →
     ZCode → Sign in). Since ZCode 3.15 it saves an OAuth token
@@ -53,13 +52,12 @@
     loader logs `orx: ZCode app-server sign-in: patched|native|unavailable`.
     On a build where it finds nothing to change, API-key providers still
     work, and a Coding Plan turn says so.
-  - API key: set `ZAI_API_KEY` (Z.ai API, billed from the balance) or
-    `BIGMODEL_API_KEY` (BigModel API) in Settings → Environment, as for the
-    other harnesses. The runtime reads no key from the environment, so for
-    each turn orx writes its own copy of the app's `provider_config.json`
-    with that provider added (mode 0600, in orx's data directory) and points
-    `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` at it; the app's files are left
-    alone. Providers with a key enabled in the ZCode app are listed too.
+  - API key: add a provider with a key in the ZCode app (Settings →
+    Providers: Z.ai API billed from the balance, Z.ai Coding Plan by key, or
+    a custom one), then Refresh the agent in orx. The app keeps the key in
+    `~/.zcode/v2/provider_config.json` (`config.access.apiKey`), where the
+    runtime reads it; orx stores no key of its own, as for the other agents,
+    and lists the provider's models under API key.
   - Start Plan works only inside the app: its endpoint
     (`zcode.z.ai/api/v1/zcode-plan`) needs a captcha token the app obtains, and
     the Coding Plan endpoints answer `1113` for a Start Plan account.

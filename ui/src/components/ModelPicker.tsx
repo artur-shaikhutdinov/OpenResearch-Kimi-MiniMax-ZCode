@@ -112,7 +112,6 @@ export function ModelPicker({
   value,
   onSelect,
   onOpenSettings,
-  onOpenEnvironment,
   permissionChoices = [],
   defaultPermissionId,
   onSelectPermission,
@@ -130,8 +129,6 @@ export function ModelPicker({
   value: ModelSelection | null;
   onSelect: (value: ModelSelection) => void;
   onOpenSettings: () => void;
-  /** Settings → Environment, where an API key is added. */
-  onOpenEnvironment?: () => void;
   permissionChoices?: OptionChoice[];
   defaultPermissionId?: string | null;
   onSelectPermission?: (id: string) => void;
@@ -285,7 +282,8 @@ export function ModelPicker({
   };
 
   /** Switch provider: the same model there when it has it, else its first.
-   * A provider with no models yet opens where it is set up instead. */
+   * A provider with no models yet opens the agent's settings, which say how
+   * to set it up. */
   const chooseProvider = (id: string) => {
     const next = selectedHarness && providerSwitchTarget(selectedHarness.models, value?.model, id, harnessModelLabel);
     if (selectedHarness && next) {
@@ -293,8 +291,7 @@ export function ModelPicker({
       return;
     }
     close();
-    if (id === "api-key" && onOpenEnvironment) onOpenEnvironment();
-    else onOpenSettings();
+    onOpenSettings();
   };
 
   const autonomyChoices: (OptionChoice & { id: Autonomy })[] = [
@@ -549,7 +546,7 @@ export function ModelPicker({
                   description: group.available
                     ? undefined
                     : group.id === "api-key"
-                      ? m.model_picker_provider_needs_key({ keys: group.description ?? m.onboarding_api_key() })
+                      ? m.model_picker_provider_needs_key({ harness: selectedHarness?.name ?? "" })
                       : m.model_picker_provider_needs_sign_in(),
                 })),
                 selectedProvider?.id,
